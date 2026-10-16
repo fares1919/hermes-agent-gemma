@@ -3,7 +3,7 @@ from fastapi import FastAPI, HTTPException
 from openai import OpenAI
 from pydantic import BaseModel
 
-app = FastAPI(title="Hermes Agent - Gemma 3 1B")
+app = FastAPI(title="Hermes Agent - gemma4:31b-cloud")
 
 client = OpenAI(
     base_url="https://ollama.com/v1",
@@ -16,7 +16,7 @@ class ChatRequest(BaseModel):
 
 @app.get("/")
 def home():
-    return {"status": "live", "model": "gemma3:1b"}
+    return {"status": "live", "model": "gemma4:31b-cloud"}
 
 @app.post("/chat")
 def chat(req: ChatRequest):
@@ -24,10 +24,10 @@ def chat(req: ChatRequest):
         raise HTTPException(status_code=500, detail="OLLAMA_API_KEY manquante")
     try:
         completion = client.chat.completions.create(
-            model="gemma3:1b",
+            model="gemma4:31b-cloud",
             messages=[{"role": "system", "content": req.system}, {"role": "user", "content": req.prompt}],
             temperature=0.7
         )
-        return {"model": "gemma3:1b", "response": completion.choices[0].message.content}
+        return {"model": "gemma4:31b-cloud", "response": completion.choices[0].message.content}
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
