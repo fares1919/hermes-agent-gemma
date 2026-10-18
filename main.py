@@ -41,15 +41,20 @@ _state = {
 }
 
 # --------------------------------------------------------------------------
-# Memoire (MongoDB Atlas)
+# Memoire (MongoDB Atlas) - degrade proprement si indisponible
 # --------------------------------------------------------------------------
 MONGO_URI = os.getenv("MONGO_URI")
 MEMORY_TURNS = int(os.getenv("MEMORY_TURNS", "10"))
 MONGO_DB = os.getenv("MONGO_DB", "hermes")
 MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "messages")
+MONGO_TIMEOUT_MS = int(os.getenv("MONGO_TIMEOUT_MS", "4000"))
+MONGO_RETRY_SECONDS = float(os.getenv("MONGO_RETRY_SECONDS", "60"))
 
 _mongo_client = None
 _collection = None
+_index_ready = False
+_mongo_error = None
+_mongo_retry_after = 0.0
 
 app = FastAPI(title="Hermes Agent - multi-provider + memory")
 
@@ -61,15 +66,38 @@ def _mask(secret):
 
 
 def get_collection():
-    global _mongo_client, _collection
+    """Retourne la collection Mongo, ou None si indisponible.
+    Ne leve jamais : la memoire ne doit pas casser l'API."""
+    global _mongo_client, _collection, _index_ready, _mongo_error, _mongo_retry_after
+
     if not MONGO_URI:
         return None
+
     if _collection is None:
-        _mongo_client = MongoClient(
-            MONGO_URI, serverSelectionTimeoutMS=5000, appname="hermes-agent-gemma"
-        )
-        _collection = _mongo_client[MONGO_DB][MONGO_COLLECTION]
-        _collection.create_index([("user_id", 1), ("session_id", 1), ("created_at", -1)])
+        try:
+            _mongo_client = MongoClient(
+                MONGO_URI,
+                serverSelectionTimeoutMS=MONGO_TIMEOUT_MS,
+                appname="hermes-agent-gemma",
+            )
+            _collection = _mongo_client[MONGO_DB][MONGO_COLLECTION]
+        except Exception as exc:  # noqa: BLE001
+            _mongo_error = str(exc)[:300]
+            _mongo_retry_after = time.time() + MONGO_RETRY_SECONDS
+            return None
+
+    if not _index_ready:
+        if time.time() < _mongo_retry_after:
+            return None
+        try:
+            _collection.create_index([("user_id", 1), ("session_id", 1), ("created_at", -1)])
+            _index_ready = True
+            _mongo_error = None
+        except Exception as exc:  # noqa: BLE001
+            _mongo_error = str(exc)[:300]
+            _mongo_retry_after = time.time() + MONGO_RETRY_SECONDS
+            return None
+
     return _collection
 
 
@@ -132,7 +160,8 @@ def home():
     return {
         "status": "live",
         "app": APP_NAME,
-        "memory": bool(MONGO_URI),
+        "memory": bool(MONGO_URI) and _index_ready,
+        "storage_configured": bool(MONGO_URI),
         "provider_order": [p for p in PROVIDER_ORDER if p in PROVIDERS],
         "models": {n: PROVIDERS[n]["model"] for n in PROVIDER_ORDER if n in PROVIDERS},
     }
@@ -164,25 +193,32 @@ def providers():
 @app.get("/health/db")
 def health_db():
     col = get_collection()
+    info = {
+        "mongo": col is not None,
+        "configured": bool(MONGO_URI),
+        "database": MONGO_DB,
+        "collection": MONGO_COLLECTION,
+        "error": _mongo_error,
+        "retry_in_s": max(0, round(_mongo_retry_after - time.time())),
+    }
     if col is None:
-        return {"mongo": False, "detail": "MONGO_URI non configuree"}
+        return info
     try:
         col.database.client.admin.command("ping")
-        return {
-            "mongo": True,
-            "database": MONGO_DB,
-            "collection": MONGO_COLLECTION,
-            "documents": col.estimated_document_count(),
-        }
+        info["documents"] = col.estimated_document_count()
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=500, detail=f"MongoDB: {exc}")
+        info["mongo"] = False
+        info["error"] = str(exc)[:300]
+    return info
 
 
 @app.get("/history/{user_id}")
 def history(user_id: str, limit: int = 10):
     col = get_collection()
     if col is None:
-        raise HTTPException(status_code=503, detail="Memoire non configuree (MONGO_URI)")
+        raise HTTPException(
+            status_code=503, detail={"message": "Memoire indisponible", "error": _mongo_error}
+        )
     docs = list(
         col.find({"user_id": user_id}, {"_id": 0})
         .sort("created_at", -1)
@@ -214,6 +250,7 @@ def chat(req: ChatRequest):
 
     answer, provider_name, model_name = call_llm(messages)
 
+    stored = False
     if col is not None:
         try:
             col.insert_one(
@@ -227,13 +264,16 @@ def chat(req: ChatRequest):
                     "created_at": datetime.now(timezone.utc),
                 }
             )
+            stored = True
         except Exception:  # noqa: BLE001
-            pass
+            stored = False
 
     return {
         "provider": provider_name,
         "model": model_name,
         "fallback_used": provider_name != (PROVIDER_ORDER[0] if PROVIDER_ORDER else None),
+        "memory_enabled": col is not None,
+        "stored": stored,
         "remembered_turns": len(history_docs),
         "response": answer,
     }
