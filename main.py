@@ -88,6 +88,14 @@ SEARCH_API_KEY = os.getenv("SEARCH_API_KEY")
 SEARXNG_URL = os.getenv("SEARXNG_URL")
 SEARCH_MAX_RESULTS = int(os.getenv("SEARCH_MAX_RESULTS", "5"))
 SEARCH_TIMEOUT = float(os.getenv("SEARCH_TIMEOUT", "20"))
+SEARCH_LANG = os.getenv("SEARCH_LANG", "fr").strip()
+SEARCH_COUNTRY = os.getenv("SEARCH_COUNTRY", "").strip()
+SEARCH_EXTRA_SNIPPETS = os.getenv("SEARCH_EXTRA_SNIPPETS", "true").lower() in ("1", "true", "yes", "on")
+# Garde-fou : au-dela de ce nombre d'appels payants par jour, on repasse
+# automatiquement sur le moteur gratuit. 30/jour ~ 900/mois, sous le credit gratuit.
+SEARCH_DAILY_LIMIT = int(os.getenv("SEARCH_DAILY_LIMIT", "30"))
+PAID_BACKENDS = ("brave", "tavily", "serper")
+_search_usage = {"day": "", "count": 0}
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
@@ -497,21 +505,29 @@ def search_duckduckgo(query, limit):
 
 
 def search_brave(query, limit):
+    params = {"q": query, "count": limit}
+    if SEARCH_COUNTRY:
+        params["country"] = SEARCH_COUNTRY
+    if SEARCH_LANG:
+        params["search_lang"] = SEARCH_LANG
+    if SEARCH_EXTRA_SNIPPETS:
+        params["extra_snippets"] = "true"
     data = json.loads(
         _http_get(
-            "https://api.search.brave.com/res/v1/web/search?"
-            + urllib.parse.urlencode({"q": query, "count": limit}),
+            "https://api.search.brave.com/res/v1/web/search?" + urllib.parse.urlencode(params),
             headers={"X-Subscription-Token": SEARCH_API_KEY or "", "Accept": "application/json"},
         )
     )
-    return [
-        {
-            "titre": item.get("title", ""),
-            "url": item.get("url", ""),
-            "extrait": _strip_html(item.get("description", "")),
-        }
-        for item in (data.get("web", {}) or {}).get("results", [])[:limit]
-    ]
+    out = []
+    for item in (data.get("web", {}) or {}).get("results", [])[:limit]:
+        snippet = _strip_html(item.get("description", ""))
+        extras = [_strip_html(e) for e in (item.get("extra_snippets") or [])[:3]]
+        if extras:
+            snippet = (snippet + " " + " ".join(extras)).strip()
+        out.append(
+            {"titre": item.get("title", ""), "url": item.get("url", ""), "extrait": snippet[:600]}
+        )
+    return out
 
 
 def search_tavily(query, limit):
@@ -570,18 +586,48 @@ SEARCH_BACKENDS = {
 }
 
 
+def _search_day_rollover():
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if _search_usage["day"] != today:
+        _search_usage["day"] = today
+        _search_usage["count"] = 0
+
+
+def search_budget():
+    """Compteur d'appels payants du jour (remis a zero chaque jour UTC)."""
+    _search_day_rollover()
+    used = _search_usage["count"]
+    unlimited = SEARCH_DAILY_LIMIT <= 0
+    return {
+        "limite_jour": None if unlimited else SEARCH_DAILY_LIMIT,
+        "utilises_aujourd_hui": used,
+        "restants_aujourd_hui": None if unlimited else max(0, SEARCH_DAILY_LIMIT - used),
+    }
+
+
+def _paid_allowed():
+    _search_day_rollover()
+    return SEARCH_DAILY_LIMIT <= 0 or _search_usage["count"] < SEARCH_DAILY_LIMIT
+
+
+def _search_use():
+    _search_day_rollover()
+    _search_usage["count"] += 1
+
+
 def _search_chain():
     """Ordre des moteurs : celui demande s'il y a une cle, sinon les moteurs
-    sans cle (SearXNG si configure, puis DuckDuckGo)."""
+    sans cle (SearXNG si configure, puis DuckDuckGo).
+    Des que le quota payant du jour est epuise, on repasse au gratuit."""
     if SEARCH_PROVIDER in SEARCH_BACKENDS and SEARCH_PROVIDER != "auto":
-        if SEARCH_PROVIDER in ("duckduckgo", "searxng") or SEARCH_API_KEY:
-            chain = [SEARCH_PROVIDER]
-        else:
-            chain = []
+        usable = SEARCH_PROVIDER not in PAID_BACKENDS or SEARCH_API_KEY
+        chain = [SEARCH_PROVIDER] if usable else []
     elif SEARCH_API_KEY:
         chain = ["brave", "tavily", "serper"]
     else:
         chain = []
+    if not _paid_allowed():
+        chain = [b for b in chain if b not in PAID_BACKENDS]
     if SEARXNG_URL:
         chain.append("searxng")
     chain.append("duckduckgo")
@@ -610,8 +656,14 @@ def tool_web_search(args):
             errors.append(f"{backend}: {exc}")
             continue
         if results:
+            if backend in PAID_BACKENDS:
+                _search_use()
             return json.dumps(
-                {"requete": query, "moteur": backend, "resultats": results},
+                {
+                    "requete": query,
+                    "moteur": backend,
+                    "resultats": results,
+                },
                 ensure_ascii=False,
             )
         errors.append(f"{backend}: aucun resultat")
@@ -1020,6 +1072,7 @@ def home():
         "tools": TOOL_NAMES,
         "search_backend": active_search_backend(),
         "search_configured": bool(SEARCH_API_KEY or SEARXNG_URL),
+        "search_budget": search_budget(),
         "provider_order": [p for p in PROVIDER_ORDER if p in PROVIDERS],
         "models": {n: PROVIDERS[n]["model"] for n in PROVIDER_ORDER if n in PROVIDERS},
     }
@@ -1030,6 +1083,7 @@ def tools_list():
     return {
         "enabled": TOOLS_ENABLED,
         "search_backend": active_search_backend(),
+        "search_budget": search_budget(),
         "tools": TOOL_SCHEMAS,
     }
 
