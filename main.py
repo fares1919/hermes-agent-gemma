@@ -1,5 +1,6 @@
 import ast
 import html as htmlmod
+import io
 import ipaddress
 import json
 import math
@@ -13,7 +14,7 @@ import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, StreamingResponse
 from openai import OpenAI
@@ -26,8 +27,9 @@ CHAT_UI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat.ht
 DEFAULT_SYSTEM = (
     "Tu es Hermes Agent, un assistant expert en automatisation. "
     "Tu disposes d'outils : utilise-les quand c'est utile (heure, calculs, notes, rappels, "
-    "recherche web, lecture de page). Ne pretends jamais avoir fait une recherche ou "
-    "enregistre une note sans avoir appele l'outil correspondant. "
+    "recherche web, lecture de page, documents joints). "
+    "Ne pretends jamais avoir fait une recherche, enregistre une note ou lu un document "
+    "sans avoir appele l'outil correspondant. "
     "Reponds en francais de facon concise et utile."
 )
 
@@ -66,6 +68,8 @@ MONGO_DB = os.getenv("MONGO_DB", "hermes")
 MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "messages")
 MONGO_NOTES_COLLECTION = os.getenv("MONGO_NOTES_COLLECTION", "notes")
 MONGO_REMINDERS_COLLECTION = os.getenv("MONGO_REMINDERS_COLLECTION", "reminders")
+MONGO_DOCS_COLLECTION = os.getenv("MONGO_DOCS_COLLECTION", "documents")
+MONGO_SESSIONS_COLLECTION = os.getenv("MONGO_SESSIONS_COLLECTION", "sessions")
 MONGO_TIMEOUT_MS = int(os.getenv("MONGO_TIMEOUT_MS", "4000"))
 MONGO_RETRY_SECONDS = float(os.getenv("MONGO_RETRY_SECONDS", "60"))
 
@@ -81,6 +85,10 @@ _mongo_retry_after = 0.0
 TOOLS_ENABLED = os.getenv("TOOLS_ENABLED", "true").lower() in ("1", "true", "yes", "on")
 MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "5"))
 WEB_FETCH_MAX_CHARS = int(os.getenv("WEB_FETCH_MAX_CHARS", "4000"))
+# Documents joints
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_BYTES", str(8 * 1024 * 1024)))
+DOC_TEXT_LIMIT = int(os.getenv("DOC_TEXT_LIMIT", "300000"))
+DOC_READ_CHARS = int(os.getenv("DOC_READ_CHARS", "6000"))
 
 # Recherche web : un fournisseur a cle si disponible, sinon DuckDuckGo (sans cle).
 SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "auto").strip().lower()
@@ -183,6 +191,14 @@ def get_notes_collection():
 
 def get_reminders_collection():
     return _sibling_collection(MONGO_REMINDERS_COLLECTION)
+
+
+def get_docs_collection():
+    return _sibling_collection(MONGO_DOCS_COLLECTION)
+
+
+def get_sessions_collection():
+    return _sibling_collection(MONGO_SESSIONS_COLLECTION)
 
 
 # ----------------------------- Providers ----------------------------------
@@ -774,6 +790,136 @@ def tool_cancel_reminder(args, user_id):
     return json.dumps({"annule": deleted}, ensure_ascii=False)
 
 
+# ------------------------------ Documents ---------------------------------
+
+TEXT_EXTENSIONS = (
+    ".txt", ".md", ".log", ".csv", ".tsv", ".json", ".yml", ".yaml",
+    ".py", ".js", ".ts", ".sql", ".ini", ".cfg", ".conf", ".srt", ".vtt",
+)
+HTML_EXTENSIONS = (".html", ".htm")
+
+
+def extract_document_text(filename, raw):
+    """Retourne (texte, type). Leve ValueError si le format n'est pas exploitable."""
+    ext = os.path.splitext(filename or "")[1].lower()
+    if ext == ".pdf":
+        try:
+            from pypdf import PdfReader  # import tardif : optionnel
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError("lecture PDF indisponible sur ce serveur") from exc
+        try:
+            reader = PdfReader(io.BytesIO(raw))
+            pages = [(page.extract_text() or "") for page in reader.pages[:300]]
+        except Exception as exc:  # noqa: BLE001
+            raise ValueError(f"PDF illisible: {exc}") from exc
+        return "\n\n".join(pages), "pdf"
+    if ext in HTML_EXTENSIONS:
+        return _strip_html(raw.decode("utf-8", "replace")), "html"
+    if ext in TEXT_EXTENSIONS or not ext:
+        return raw.decode("utf-8", "replace"), "texte"
+    try:
+        return raw.decode("utf-8"), "texte"
+    except UnicodeDecodeError as exc:
+        raise ValueError(f"format non pris en charge: {ext or 'inconnu'}") from exc
+
+
+def _doc_out(doc):
+    return {
+        "id": doc.get("doc_id"),
+        "nom": doc.get("name"),
+        "type": doc.get("kind"),
+        "caracteres": doc.get("chars"),
+        "ajoute_le": _iso(_as_utc(doc.get("created_at"))),
+    }
+
+
+def _find_document(docs, user_id, reference):
+    ref = str(reference or "").strip()
+    if not ref:
+        return None
+    doc = docs.find_one({"user_id": user_id, "$or": [{"doc_id": ref}, {"name": ref}]})
+    if doc is None:
+        doc = docs.find_one({"user_id": user_id, "name": {"$regex": re.escape(ref), "$options": "i"}})
+    if doc is None and not ref:
+        doc = docs.find_one({"user_id": user_id}, sort=[("created_at", -1)])
+    return doc
+
+
+def tool_list_documents(args, user_id):
+    docs = get_docs_collection()
+    if docs is None:
+        return "erreur: memoire indisponible"
+    rows = list(
+        docs.find({"user_id": user_id}, {"_id": 0, "text": 0}).sort("created_at", -1).limit(30)
+    )
+    return json.dumps([_doc_out(d) for d in rows], ensure_ascii=False)
+
+
+def tool_read_document(args, user_id):
+    docs = get_docs_collection()
+    if docs is None:
+        return "erreur: memoire indisponible"
+    doc = _find_document(docs, user_id, args.get("document"))
+    if doc is None:
+        available = [
+            d.get("name")
+            for d in docs.find({"user_id": user_id}, {"_id": 0, "name": 1}).sort("created_at", -1).limit(20)
+        ]
+        return json.dumps(
+            {"erreur": "document introuvable", "documents_disponibles": available}, ensure_ascii=False
+        )
+    text = doc.get("text") or ""
+    start = max(0, int(args.get("debut") or 0))
+    length = max(200, min(int(args.get("longueur") or DOC_READ_CHARS), DOC_READ_CHARS * 3))
+    chunk = text[start:start + length]
+    return json.dumps(
+        {
+            "document": doc.get("name"),
+            "id": doc.get("doc_id"),
+            "caracteres_total": len(text),
+            "plage": f"{start}-{start + len(chunk)}",
+            "suite_disponible": start + len(chunk) < len(text),
+            "texte": chunk,
+        },
+        ensure_ascii=False,
+    )
+
+
+def tool_search_documents(args, user_id):
+    docs = get_docs_collection()
+    if docs is None:
+        return "erreur: memoire indisponible"
+    needle = str(args.get("query", "")).strip()
+    if not needle:
+        return "erreur: requete vide"
+    limit = max(1, min(int(args.get("max_results") or 5), 20))
+    pattern = re.compile(re.escape(needle), re.I)
+    results = []
+    for doc in docs.find(
+        {"user_id": user_id}, {"_id": 0, "doc_id": 1, "name": 1, "text": 1}
+    ).sort("created_at", -1).limit(20):
+        text = doc.get("text") or ""
+        extraits = []
+        for match in pattern.finditer(text):
+            extraits.append(
+                text[max(0, match.start() - 120): match.end() + 120].replace("\n", " ").strip()
+            )
+            if len(extraits) >= 3:
+                break
+        if extraits:
+            results.append(
+                {
+                    "id": doc.get("doc_id"),
+                    "nom": doc.get("name"),
+                    "occurrences": len(pattern.findall(text)),
+                    "extraits": extraits,
+                }
+            )
+        if len(results) >= limit:
+            break
+    return json.dumps({"requete": needle, "documents": results}, ensure_ascii=False)
+
+
 def execute_tool(name, args, user_id):
     try:
         if name == "get_datetime":
@@ -784,6 +930,12 @@ def execute_tool(name, args, user_id):
             return tool_web_search(args)
         if name == "web_fetch":
             return tool_web_fetch(args)
+        if name == "list_documents":
+            return tool_list_documents(args, user_id)
+        if name == "read_document":
+            return tool_read_document(args, user_id)
+        if name == "search_documents":
+            return tool_search_documents(args, user_id)
         if name == "save_note":
             return tool_save_note(args, user_id)
         if name == "list_notes":
@@ -855,6 +1007,51 @@ TOOL_SCHEMAS = [
                 "type": "object",
                 "properties": {"url": {"type": "string"}},
                 "required": ["url"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_documents",
+            "description": (
+                "Liste les documents joints par l'utilisateur (PDF, texte, CSV, JSON...). "
+                "A appeler des que l'utilisateur parle d'un document, d'un fichier ou d'une piece jointe."
+            ),
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "read_document",
+            "description": (
+                "Lit le contenu d'un document joint. Si le document est long, "
+                "enchaines les appels en augmentant 'debut' jusqu'a 'suite_disponible' = false."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "document": {"type": "string", "description": "Nom ou identifiant du document."},
+                    "debut": {"type": "integer", "description": "Position de depart en caracteres (defaut 0)."},
+                    "longueur": {"type": "integer", "description": "Nombre de caracteres a lire (defaut 6000)."},
+                },
+                "required": ["document"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_documents",
+            "description": "Cherche un mot ou une phrase dans les documents joints de l'utilisateur.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "max_results": {"type": "integer", "description": "Nombre de documents examines (defaut 5)."},
+                },
+                "required": ["query"],
             },
         },
     },
@@ -1161,6 +1358,24 @@ def _need_reminders():
     return col
 
 
+def _need_docs():
+    col = get_docs_collection()
+    if col is None:
+        raise HTTPException(
+            status_code=503, detail={"message": "Memoire indisponible", "error": _mongo_error}
+        )
+    return col
+
+
+def _need_sessions():
+    col = get_sessions_collection()
+    if col is None:
+        raise HTTPException(
+            status_code=503, detail={"message": "Memoire indisponible", "error": _mongo_error}
+        )
+    return col
+
+
 @app.get("/history/{user_id}")
 def history(user_id: str, limit: int = 10, session_id: str | None = None):
     col = _need_memory()
@@ -1192,17 +1407,167 @@ def sessions(user_id: str, limit: int = 50):
         {"$sort": {"last_at": -1}},
         {"$limit": max(1, min(limit, 200))},
     ]
-    out = [
-        {
-            "session_id": row.get("_id") or "default",
-            "messages": row.get("messages", 0),
-            "titre": (row.get("first_prompt") or row.get("last_prompt") or "")[:90],
-            "last_prompt": (row.get("last_prompt") or "")[:90],
-            "last_at": _iso(_as_utc(row.get("last_at"))),
-        }
-        for row in col.aggregate(pipeline)
-    ]
+    rows = list(col.aggregate(pipeline))
+    titles = {}
+    meta = get_sessions_collection()
+    if meta is not None:
+        try:
+            titles = {
+                d.get("session_id"): (d.get("title") or "").strip()
+                for d in meta.find(
+                    {"user_id": user_id}, {"_id": 0, "session_id": 1, "title": 1}
+                )
+            }
+        except Exception:  # noqa: BLE001
+            titles = {}
+
+    out = []
+    for row in rows:
+        sid = row.get("_id") or "default"
+        custom = titles.get(sid) or ""
+        out.append(
+            {
+                "session_id": sid,
+                "messages": row.get("messages", 0),
+                "titre": custom or (row.get("first_prompt") or row.get("last_prompt") or "")[:90],
+                "titre_personnalise": custom or None,
+                "last_prompt": (row.get("last_prompt") or "")[:90],
+                "last_at": _iso(_as_utc(row.get("last_at"))),
+            }
+        )
     return {"user_id": user_id, "count": len(out), "sessions": out}
+
+
+class RenameRequest(BaseModel):
+    title: str
+
+
+@app.patch("/sessions/{user_id}/{session_id}")
+def rename_session(user_id: str, session_id: str, req: RenameRequest):
+    """Donne un nom a un fil (titre vide = retour au titre automatique)."""
+    col = _need_sessions()
+    title = (req.title or "").strip()[:120]
+    now = datetime.now(timezone.utc)
+    if not title:
+        col.delete_many({"user_id": user_id, "session_id": session_id})
+        return {"user_id": user_id, "session_id": session_id, "titre": None}
+    col.update_one(
+        {"user_id": user_id, "session_id": session_id},
+        {"$set": {"title": title, "updated_at": now}, "$setOnInsert": {"created_at": now}},
+        upsert=True,
+    )
+    return {"user_id": user_id, "session_id": session_id, "titre": title}
+
+
+@app.delete("/sessions/{user_id}/{session_id}")
+def delete_session(user_id: str, session_id: str):
+    col = _need_memory()
+    deleted = col.delete_many({"user_id": user_id, "session_id": session_id}).deleted_count
+    meta = get_sessions_collection()
+    if meta is not None:
+        meta.delete_many({"user_id": user_id, "session_id": session_id})
+    docs = get_docs_collection()
+    if docs is not None:
+        docs.delete_many({"user_id": user_id, "session_id": session_id})
+    return {"user_id": user_id, "session_id": session_id, "deleted_messages": deleted}
+
+
+@app.get("/search/{user_id}")
+def search_history(user_id: str, q: str, limit: int = 20):
+    """Recherche dans l'historique des messages de l'utilisateur."""
+    col = _need_memory()
+    needle = (q or "").strip()
+    if len(needle) < 2:
+        raise HTTPException(status_code=400, detail="requete trop courte (2 caracteres minimum)")
+    pattern = re.compile(re.escape(needle[:120]), re.I)
+    query = {"user_id": user_id, "$or": [{"prompt": pattern}, {"response": pattern}]}
+    docs = list(
+        col.find(query, {"_id": 0}).sort("created_at", -1).limit(max(1, min(limit, 50)))
+    )
+    results = []
+    for doc in docs:
+        prompt = doc.get("prompt") or ""
+        response = doc.get("response") or ""
+        haystack = prompt if pattern.search(prompt) else response
+        match = pattern.search(haystack or "")
+        start = max(0, (match.start() if match else 0) - 80)
+        results.append(
+            {
+                "session_id": doc.get("session_id"),
+                "extrait": (haystack[start:start + 220] or "").replace("\n", " ").strip(),
+                "created_at": _iso(_as_utc(doc.get("created_at"))),
+                "prompt": prompt[:160],
+            }
+        )
+    return {"user_id": user_id, "query": needle, "count": len(results), "results": results}
+
+
+@app.post("/upload/{user_id}")
+async def upload_document(
+    user_id: str,
+    file: UploadFile = File(...),
+    session_id: str = Form("default"),
+):
+    """Recoit un fichier (PDF, texte, CSV...), en extrait le texte et le range."""
+    docs = _need_docs()
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(status_code=400, detail="fichier vide")
+    if len(raw) > MAX_UPLOAD_BYTES:
+        raise HTTPException(
+            status_code=413,
+            detail=f"fichier trop volumineux (max {MAX_UPLOAD_BYTES // (1024 * 1024)} Mo)",
+        )
+    try:
+        text, kind = extract_document_text(file.filename or "document", raw)
+    except ValueError as exc:
+        raise HTTPException(status_code=415, detail=str(exc)) from exc
+    text = text.strip()
+    if not text:
+        raise HTTPException(
+            status_code=422,
+            detail="aucun texte exploitable dans ce fichier (PDF scanne sans couche texte ?)",
+        )
+    truncated = len(text) > DOC_TEXT_LIMIT
+    text = text[:DOC_TEXT_LIMIT]
+    doc = {
+        "doc_id": uuid.uuid4().hex[:8],
+        "user_id": user_id,
+        "session_id": session_id,
+        "name": (file.filename or "document")[:200],
+        "kind": kind,
+        "size": len(raw),
+        "chars": len(text),
+        "tronque": truncated,
+        "text": text,
+        "created_at": datetime.now(timezone.utc),
+    }
+    docs.insert_one(doc)
+    return {
+        **_doc_out(doc),
+        "taille_octets": len(raw),
+        "tronque": truncated,
+        "apercu": text[:400],
+        "message": "Document ajoute. L'agent peut le lire avec read_document.",
+    }
+
+
+@app.get("/documents/{user_id}")
+def documents(user_id: str, limit: int = 50):
+    docs = _need_docs()
+    rows = list(
+        docs.find({"user_id": user_id}, {"_id": 0, "text": 0})
+        .sort("created_at", -1)
+        .limit(max(1, min(limit, 200)))
+    )
+    return {"user_id": user_id, "count": len(rows), "documents": list(map(_doc_out, rows))}
+
+
+@app.delete("/documents/{user_id}/{doc_id}")
+def delete_document(user_id: str, doc_id: str):
+    docs = _need_docs()
+    deleted = docs.delete_many({"user_id": user_id, "doc_id": doc_id}).deleted_count
+    return {"deleted": deleted}
 
 
 @app.delete("/history/{user_id}")
@@ -1212,17 +1577,35 @@ def delete_history(user_id: str, session_id: str | None = None):
     if session_id:
         query["session_id"] = session_id
     deleted = col.delete_many(query).deleted_count
-    notes = get_notes_collection()
-    notes_deleted = notes.delete_many({"user_id": user_id}).deleted_count if notes is not None else 0
-    reminders = get_reminders_collection()
-    reminders_deleted = (
-        reminders.delete_many({"user_id": user_id}).deleted_count if reminders is not None else 0
-    )
+
+    doc_query = {"user_id": user_id}
+    if session_id:
+        doc_query["session_id"] = session_id
+    docs = get_docs_collection()
+    docs_deleted = docs.delete_many(doc_query).deleted_count if docs is not None else 0
+
+    meta = get_sessions_collection()
+    sessions_deleted = meta.delete_many(query).deleted_count if meta is not None else 0
+
+    # Notes et rappels ne sont pas rattaches a un fil : on ne les purge
+    # que si l'on efface tout l'utilisateur.
+    notes_deleted = reminders_deleted = 0
+    if not session_id:
+        notes = get_notes_collection()
+        notes_deleted = notes.delete_many({"user_id": user_id}).deleted_count if notes is not None else 0
+        reminders = get_reminders_collection()
+        reminders_deleted = (
+            reminders.delete_many({"user_id": user_id}).deleted_count if reminders is not None else 0
+        )
+
     return {
         "user_id": user_id,
+        "session_id": session_id,
         "deleted_messages": deleted,
         "deleted_notes": notes_deleted,
         "deleted_reminders": reminders_deleted,
+        "deleted_documents": docs_deleted,
+        "deleted_sessions": sessions_deleted,
     }
 
 

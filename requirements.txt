@@ -4,3 +4,5 @@ openai
 python-dotenv
 pymongo
 dnspython
+python-multipart
+pypdf
