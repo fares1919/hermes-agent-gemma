@@ -137,6 +137,35 @@
   .session__t b{font-weight:600;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
   .session__t i{font-style:normal;font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--muted-dim);flex:none}
   .session__m{font-size:11px;color:var(--muted-dim);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .session__foot{display:flex;align-items:center;gap:6px}
+  .session__foot .session__m{flex:1;min-width:0}
+  .session__acts{display:flex;gap:3px;flex:none;opacity:0;transition:opacity .14s ease}
+  .session:hover .session__acts,.session:focus-within .session__acts,.session[data-active="1"] .session__acts{opacity:1}
+  .session__acts button{padding:2px 6px;font-size:10px;line-height:1.4;background:transparent;border-color:var(--line-soft);color:var(--muted-dim)}
+  .session__acts button:hover{color:var(--amber-soft);border-color:rgba(224,166,60,.5)}
+  .session__acts button.del:hover{color:#f0a596;border-color:rgba(217,99,79,.6)}
+  input.rename{width:100%;font-family:inherit;font-size:12.5px;padding:3px 6px;background:var(--surface-3);border:1px solid rgba(224,166,60,.55);border-radius:5px;color:var(--text)}
+  input.rename:focus{outline:none}
+
+  .findbar{margin-bottom:calc(var(--step)*1.5)}
+  .hits{display:flex;flex-direction:column;gap:4px;max-height:200px;overflow-y:auto}
+  .hits:not(:empty){margin:-2px 0 calc(var(--step)*1.5)}
+  .hit{display:block;width:100%;text-align:left;padding:7px 9px;background:var(--surface-2);border:1px solid var(--line-soft);border-radius:var(--radius-sm);cursor:pointer;font-size:11.5px;color:var(--muted);font-weight:400}
+  .hit:hover{border-color:rgba(224,166,60,.45);color:var(--text)}
+  .hit b{display:block;font-family:"JetBrains Mono",monospace;font-size:10px;font-weight:400;color:var(--amber-soft);margin-bottom:3px}
+  .hit span{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+
+  .doc{display:flex;align-items:center;gap:7px;padding:7px 9px;background:var(--surface-2);border:1px solid var(--line-soft);border-radius:var(--radius-sm);cursor:pointer}
+  .doc:hover{border-color:rgba(224,166,60,.45)}
+  .doc__n{flex:1;min-width:0;font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .doc__m{font-family:"JetBrains Mono",monospace;font-size:10px;color:var(--muted-dim);flex:none}
+  .doc button{padding:1px 5px;font-size:10.5px;background:transparent;border-color:transparent;color:var(--muted-dim);flex:none}
+  .doc button:hover{color:#f0a596;border-color:rgba(217,99,79,.6)}
+
+  #attach{width:42px;height:42px;padding:0;flex:none;font-size:16px;background:transparent;border-color:transparent;color:var(--muted)}
+  #attach:hover{color:var(--amber-soft);border-color:var(--line)}
+  .dropzone{position:absolute;inset:0;z-index:5;display:none;align-items:center;justify-content:center;background:rgba(10,12,14,.85);border:2px dashed rgba(224,166,60,.5);font-size:14px;color:var(--amber-soft);pointer-events:none}
+  body[data-drop="1"] .dropzone{display:flex}
 
   /* switch */
   .switch{display:flex;align-items:center;justify-content:space-between;gap:var(--step)}
@@ -161,7 +190,7 @@
   .rail__foot code{font-family:"JetBrains Mono",monospace;color:var(--muted)}
 
   /* ---------------- stage ---------------- */
-  .stage{display:flex;flex-direction:column;min-width:0;min-height:0}
+  .stage{display:flex;flex-direction:column;min-width:0;min-height:0;position:relative}
   .topbar{
     display:flex;align-items:center;gap:calc(var(--step)*1.5);
     padding:calc(var(--step)*1.75) calc(var(--step)*3);
@@ -280,6 +309,10 @@
         Fils de discussion
         <button class="ghost" id="refreshSessions" style="padding:2px 6px;font-size:10px;border-color:transparent" title="Rafraîchir">↻</button>
       </p>
+      <div class="findbar">
+        <input id="historySearch" class="mono" placeholder="Rechercher dans l'historique…" autocomplete="off" spellcheck="false" aria-label="Rechercher dans l'historique">
+      </div>
+      <div class="hits" id="searchHits" aria-live="polite"></div>
       <div class="sessions" id="sessionList"><p class="session__m">Aucun fil pour l'instant.</p></div>
     </div>
 
@@ -293,6 +326,17 @@
         </label>
       </div>
       <div class="skills" id="skillList"></div>
+    </div>
+
+    <div class="panel">
+      <p class="panel__title">
+        Documents
+        <button class="ghost" id="refreshDocs" style="padding:2px 6px;font-size:10px;border-color:transparent" title="Rafraîchir">↻</button>
+      </p>
+      <div class="hits" id="docList" style="max-height:180px"><p class="session__m">Aucun document.</p></div>
+      <div class="quick" style="margin-top:8px">
+        <button id="pickDoc">Joindre un fichier (PDF, texte, CSV)…</button>
+      </div>
     </div>
 
     <div class="panel">
@@ -353,7 +397,7 @@
       <div class="thread__inner" id="inner">
         <div class="empty" id="empty">
           <h1>Parlez à <em>Hermes</em>.</h1>
-          <p>Il se souvient de vous, cherche sur le web, calcule, prend des notes et programme des rappels. Renseignez votre identifiant, puis écrivez.</p>
+          <p>Il se souvient de vous, cherche sur le web, calcule, prend des notes, programme des rappels et lit vos documents joints. Renseignez votre identifiant, puis écrivez.</p>
         </div>
       </div>
     </div>
@@ -361,17 +405,23 @@
     <div class="composer">
       <div class="composer__inner">
         <div class="composer__box">
+          <button id="attach" aria-label="Joindre un document" title="Joindre un document (PDF, texte, CSV…)">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M21.44 11.05 12.25 20.24a5.5 5.5 0 0 1-7.78-7.78l9.2-9.19a3.67 3.67 0 1 1 5.18 5.19l-9.19 9.19a1.83 1.83 0 0 1-2.6-2.6l8.49-8.48"/></svg>
+          </button>
+          <input type="file" id="fileInput" hidden accept=".pdf,.txt,.md,.log,.csv,.tsv,.json,.yml,.yaml,.html,.htm">
           <textarea id="prompt" rows="1" placeholder="Écrivez votre message…" aria-label="Message"></textarea>
           <button id="send" aria-label="Envoyer">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M5 12h13"/><path d="m12 5 7 7-7 7"/></svg>
           </button>
         </div>
         <div class="composer__hint">
-          <span><strong>Entrée</strong> envoie · <strong>Maj+Entrée</strong> retour à la ligne</span>
+          <span><strong>Entrée</strong> envoie · <strong>Maj+Entrée</strong> retour à la ligne · trombone = document</span>
           <span id="status"></span>
         </div>
       </div>
     </div>
+
+    <div class="dropzone" id="dropzone" aria-hidden="true">Déposez le fichier pour l'ajouter à vos documents</div>
   </main>
 </div>
 
@@ -684,23 +734,219 @@
         box.innerHTML = '<p class="session__m">Aucun fil pour l\'instant.</p>';
         return;
       }
-      data.sessions.forEach((s) => {
-        const item = document.createElement("div");
-        item.className = "session";
-        item.tabIndex = 0;
-        item.dataset.active = s.session_id === state.session ? "1" : "0";
-        const when = (s.last_at || "").replace("T", " ").slice(0, 16);
-        item.innerHTML =
-          '<div class="session__t"><b>' + esc(s.session_id) + "</b><i>" + esc(when) + "</i></div>" +
-          '<div class="session__m">' + esc(s.titre || "—") + " (" + s.messages + ")</div>";
-        const open = () => switchSession(s.session_id);
-        item.addEventListener("click", open);
-        item.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
-        box.appendChild(item);
-      });
+      data.sessions.forEach((s) => box.appendChild(sessionNode(s)));
     } catch (err) {
       $("sessionList").innerHTML = '<p class="session__m">' + esc(err.message) + "</p>";
     }
+  }
+
+  function sessionNode(s) {
+    const item = document.createElement("div");
+    item.className = "session";
+    item.tabIndex = 0;
+    item.dataset.active = s.session_id === state.session ? "1" : "0";
+    const when = (s.last_at || "").replace("T", " ").slice(0, 16);
+    item.innerHTML =
+      '<div class="session__t"><b>' + esc(s.titre_personnalise || s.session_id) + "</b><i>" + esc(when) + "</i></div>" +
+      '<div class="session__foot">' +
+        '<span class="session__m">' + esc(s.titre || "—") + " (" + s.messages + ")</span>" +
+        '<span class="session__acts">' +
+          '<button data-act="rename" title="Renommer ce fil">renommer</button>' +
+          '<button class="del" data-act="delete" title="Supprimer ce fil">suppr.</button>' +
+        "</span>" +
+      "</div>";
+    const open = () => switchSession(s.session_id);
+    item.addEventListener("click", (e) => { if (!e.target.closest("button")) open(); });
+    item.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(); } });
+    item.querySelector('[data-act="rename"]').addEventListener("click", (e) => { e.stopPropagation(); startRename(item, s); });
+    item.querySelector('[data-act="delete"]').addEventListener("click", (e) => { e.stopPropagation(); deleteSession(s); });
+    return item;
+  }
+
+  function startRename(item, s) {
+    const head = item.querySelector(".session__t");
+    if (head.querySelector("input")) return;
+    head.innerHTML = "";
+    const input = document.createElement("input");
+    input.className = "rename";
+    input.value = s.titre_personnalise || s.session_id;
+    input.maxLength = 120;
+    head.appendChild(input);
+    input.focus();
+    input.select();
+    let done = false;
+    const finish = async (save) => {
+      if (done) return;
+      done = true;
+      const value = input.value.trim();
+      if (!save) { refreshSessions(); return; }
+      try {
+        await api("/sessions/" + encodeURIComponent(state.user) + "/" + encodeURIComponent(s.session_id), {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: value })
+        });
+        toast(value ? "Fil renommé : " + value : "Titre automatique rétabli", "info");
+      } catch (err) { toast(err.message); }
+      refreshSessions();
+    };
+    input.addEventListener("keydown", (e) => {
+      if (e.key === "Enter") { e.preventDefault(); finish(true); }
+      else if (e.key === "Escape") { e.preventDefault(); finish(false); }
+    });
+    input.addEventListener("blur", () => finish(true));
+  }
+
+  async function deleteSession(s) {
+    const label = s.titre_personnalise || s.session_id;
+    if (!confirm("Supprimer le fil « " + label + " » et ses " + s.messages + " message(s) ?")) return;
+    try {
+      await api("/sessions/" + encodeURIComponent(state.user) + "/" + encodeURIComponent(s.session_id), { method: "DELETE" });
+      toast("Fil supprimé", "info");
+      if (s.session_id === state.session) {
+        state.session = "fil-" + Date.now().toString(36);
+        persist();
+        clearThread('<h1>Nouveau <em>fil</em>.</h1><p>Le fil précédent a été supprimé.</p>');
+      }
+      refreshSessions();
+    } catch (err) { toast(err.message); }
+  }
+
+  /* ---- recherche dans l'historique ---- */
+  let searchTimer = null;
+
+  function onSearchInput() {
+    const q = $("historySearch").value.trim();
+    clearTimeout(searchTimer);
+    if (q.length < 2) { $("searchHits").innerHTML = ""; return; }
+    $("searchHits").innerHTML = '<p class="session__m">Recherche…</p>';
+    searchTimer = setTimeout(() => runSearch(q), 320);
+  }
+
+  async function runSearch(q) {
+    const box = $("searchHits");
+    try {
+      const d = await api("/search/" + encodeURIComponent(state.user) + "?q=" + encodeURIComponent(q) + "&limit=20");
+      box.innerHTML = "";
+      if (!d.results.length) {
+        box.innerHTML = '<p class="session__m">Aucun résultat pour « ' + esc(q) + " ».</p>";
+        return;
+      }
+      d.results.forEach((r) => {
+        const b = document.createElement("button");
+        b.type = "button";
+        b.className = "hit";
+        b.innerHTML =
+          "<b>" + esc(r.session_id) + " · " + esc(String(r.created_at || "").replace("T", " ").slice(0, 16)) + "</b>" +
+          "<span>" + esc(r.extrait || r.prompt) + "</span>";
+        b.addEventListener("click", () => {
+          $("historySearch").value = "";
+          box.innerHTML = "";
+          switchSession(r.session_id);
+        });
+        box.appendChild(b);
+      });
+    } catch (err) {
+      box.innerHTML = '<p class="session__m">' + esc(err.message) + "</p>";
+    }
+  }
+
+  /* ---- documents joints ---- */
+  async function refreshDocs() {
+    try {
+      const d = await api("/documents/" + encodeURIComponent(state.user));
+      const box = $("docList");
+      box.innerHTML = "";
+      if (!d.documents.length) {
+        box.innerHTML = '<p class="session__m">Aucun document.</p>';
+        return;
+      }
+      d.documents.forEach((doc) => {
+        const row = document.createElement("div");
+        row.className = "doc";
+        row.title = "Cliquer pour demander un résumé";
+        row.innerHTML =
+          '<span class="doc__n">' + esc(doc.nom) + "</span>" +
+          '<span class="doc__m">' + esc(doc.type) + " · " + (doc.caracteres || 0) + " c</span>" +
+          '<button title="Supprimer ce document">✕</button>';
+        row.addEventListener("click", (e) => {
+          if (e.target.closest("button")) return;
+          document.body.dataset.rail = "0";
+          promptEl.value = "Résume le document « " + doc.nom + " ».";
+          autosize();
+          promptEl.focus();
+        });
+        row.querySelector("button").addEventListener("click", async (e) => {
+          e.stopPropagation();
+          if (!confirm("Supprimer « " + doc.nom + " » ?")) return;
+          try {
+            await api("/documents/" + encodeURIComponent(state.user) + "/" + encodeURIComponent(doc.id), { method: "DELETE" });
+            toast("Document supprimé", "info");
+            refreshDocs();
+          } catch (err) { toast(err.message); }
+        });
+        box.appendChild(row);
+      });
+    } catch (err) {
+      $("docList").innerHTML = '<p class="session__m">' + esc(err.message) + "</p>";
+    }
+  }
+
+  async function uploadFile(file) {
+    if (!file || !file.name) return;
+    const note = addMessage("user", "📎 **" + file.name + "** · envoi…");
+    $("status").textContent = "envoi du fichier…";
+    const fd = new FormData();
+    fd.append("file", file, file.name);
+    fd.append("session_id", state.session);
+    try {
+      const res = await fetch(base() + "/upload/" + encodeURIComponent(state.user), { method: "POST", body: fd });
+      const text = await res.text();
+      let data = null;
+      try { data = JSON.parse(text); } catch (e) { /* ignore */ }
+      if (!res.ok) {
+        const detail = data && data.detail
+          ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail))
+          : text;
+        throw new Error(String(detail).slice(0, 260));
+      }
+      note.bubble.innerHTML = render(
+        "📎 **" + data.nom + "** · " + data.caracteres + " caractères extraits (" + data.type +
+        (data.tronque ? ", tronqué" : "") + ")"
+      );
+      toast("Document ajouté : " + data.nom, "info");
+      refreshDocs();
+      promptEl.value = "Résume le document « " + data.nom + " ».";
+      autosize();
+      promptEl.focus();
+    } catch (err) {
+      note.wrap.remove();
+      toast(err.message);
+    } finally {
+      $("status").textContent = "";
+    }
+  }
+
+  /* ---- glisser-déposer ---- */
+  function wireDrop() {
+    const stage = document.querySelector(".stage");
+    if (!stage) return;
+    ["dragenter", "dragover"].forEach((ev) =>
+      stage.addEventListener(ev, (e) => {
+        e.preventDefault();
+        document.body.dataset.drop = "1";
+      })
+    );
+    stage.addEventListener("dragleave", (e) => {
+      if (e.relatedTarget && stage.contains(e.relatedTarget)) return;
+      document.body.dataset.drop = "0";
+    });
+    stage.addEventListener("drop", (e) => {
+      e.preventDefault();
+      document.body.dataset.drop = "0";
+      const files = e.dataTransfer && e.dataTransfer.files;
+      if (files && files.length) uploadFile(files[0]);
+    });
   }
 
   async function switchSession(sessionId) {
@@ -869,6 +1115,7 @@
     clearThread('<h1>Chargement…</h1>');
     refreshSessions();
     refreshReminders();
+    refreshDocs();
     switchSession(state.session);
     startPolling();
   });
@@ -883,6 +1130,15 @@
 
   $("refreshSessions").addEventListener("click", refreshSessions);
   $("refreshProv").addEventListener("click", refreshProviders);
+  $("refreshDocs").addEventListener("click", refreshDocs);
+  $("historySearch").addEventListener("input", onSearchInput);
+  $("attach").addEventListener("click", () => $("fileInput").click());
+  $("pickDoc").addEventListener("click", () => $("fileInput").click());
+  $("fileInput").addEventListener("change", (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = "";
+    if (f) uploadFile(f);
+  });
 
   $("useTools").addEventListener("change", (e) => { state.useTools = e.target.checked; persist(); loadTools(); });
 
@@ -901,11 +1157,14 @@
     if (!confirm("Supprimer définitivement l'historique, les notes et les rappels de « " + state.user + " » ?")) return;
     try {
       const r = await api("/history/" + encodeURIComponent(state.user), { method: "DELETE" });
-      toast("Purgé : " + r.deleted_messages + " message(s), " + r.deleted_notes + " note(s), " + r.deleted_reminders + " rappel(s).", "info");
+      toast("Purgé : " + r.deleted_messages + " message(s), " + r.deleted_notes + " note(s), " + r.deleted_reminders + " rappel(s), " + (r.deleted_documents || 0) + " document(s).", "info");
       clearThread('<h1>Mémoire <em>purgée</em>.</h1><p>Repartez de zéro : l\'agent ne sait plus rien de vous.</p>');
       $("turnLabel").textContent = "0";
+      $("historySearch").value = "";
+      $("searchHits").innerHTML = "";
       refreshSessions();
       refreshReminders();
+      refreshDocs();
       refreshProviders();
     } catch (err) { toast(err.message); }
   });
@@ -926,10 +1185,12 @@
   persist();
   buildQuick();
   autosize();
+  wireDrop();
   loadTools();
   refreshProviders();
   refreshSessions();
   refreshReminders();
+  refreshDocs();
   startPolling();
   switchSession(state.session);
   promptEl.focus();
