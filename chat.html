@@ -783,20 +783,18 @@
 
   async function refreshReminders(showAll) {
     try {
-      const [due, all] = await Promise.all([
-        api("/reminders/" + encodeURIComponent(state.user) + "/due"),
-        api("/reminders/" + encodeURIComponent(state.user))
-      ]);
+      const due = await api("/reminders/" + encodeURIComponent(state.user) + "/due");
 
       if (due.due.length) {
         due.due.forEach((r) => {
-          addMessage("reminder", "**" + (r.text || "Rappel") + "**\n\n*prévu le " + String(r.due_at).replace("T", " ").slice(0, 16) + " UTC*");
+          addMessage("reminder", "**" + (r.text || "Rappel") + "**\n\nprévu le " + String(r.due_at).replace("T", " ").slice(0, 16) + " UTC");
         });
         notify("Hermes — rappel", due.due.map((r) => r.text).join(" · "));
         toast(due.due.length + " rappel(s) déclenché(s)", "info");
-        post("/reminders/ack", { user_id: state.user, ids: due.due.map((r) => r.id) }).catch(() => {});
+        await post("/reminders/ack", { user_id: state.user, ids: due.due.map((r) => r.id) }).catch(() => {});
       }
 
+      const all = await api("/reminders/" + encodeURIComponent(state.user));
       const pending = (all.reminders || []).filter((r) => !r.notifie);
       const box = $("reminderList");
       box.innerHTML = "";
