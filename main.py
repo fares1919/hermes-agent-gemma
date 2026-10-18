@@ -539,6 +539,7 @@ def search_tavily(query, limit):
             "max_results": limit,
             "search_depth": "basic",
         },
+        headers={"Authorization": f"Bearer {SEARCH_API_KEY}"},
     )
     return [
         {"titre": r.get("title", ""), "url": r.get("url", ""), "extrait": r.get("content", "")}
