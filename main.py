@@ -13,11 +13,13 @@ from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from openai import OpenAI
 from pydantic import BaseModel
 from pymongo import MongoClient
 
 APP_NAME = "Hermes Agent"
+CHAT_UI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat.html")
 
 DEFAULT_SYSTEM = (
     "Tu es Hermes Agent, un assistant expert en automatisation. "
@@ -452,11 +454,28 @@ class ChatRequest(BaseModel):
     use_tools: bool = True
 
 
+_chat_ui_cache = None
+
+
+@app.get("/ui", response_class=HTMLResponse)
+def chat_ui():
+    """Sert l'interface de chat (meme origine que l'API : aucune config)."""
+    global _chat_ui_cache
+    if _chat_ui_cache is None:
+        try:
+            with open(CHAT_UI_PATH, encoding="utf-8") as handle:
+                _chat_ui_cache = handle.read()
+        except OSError as exc:  # noqa: BLE001
+            raise HTTPException(status_code=404, detail=f"interface introuvable: {exc}") from exc
+    return HTMLResponse(_chat_ui_cache)
+
+
 @app.get("/")
 def home():
     return {
         "status": "live",
         "app": APP_NAME,
+        "ui": "/ui",
         "memory": "ready" if _index_ready else ("configured" if MONGO_URI else "off"),
         "storage_configured": bool(MONGO_URI),
         "tools_enabled": TOOLS_ENABLED,

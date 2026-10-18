@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Hermes Agent</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Crect width='24' height='24' rx='5' fill='%2314181b'/%3E%3Cg fill='none' stroke='%23e0a63c' stroke-width='1.7' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpath d='M4 13.5 12 4l8 9.5'/%3E%3Cpath d='M6.5 12.5V20h11v-7.5'/%3E%3C/g%3E%3C/svg%3E">
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600;9..144,900&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -491,7 +492,10 @@
   /* ------------------------------------------------------------------ *
    * Configuration
    * ------------------------------------------------------------------ */
-  const DEFAULT_API = "https://hermes-agent-gemma.onrender.com";
+  // Si la page est servie par l'API (Render), on reste sur la meme origine.
+  // Si elle est ouverte en local, on vise l'API deployee.
+  const IS_LOCAL = location.protocol === "file:" || /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
+  const DEFAULT_API = IS_LOCAL ? "https://hermes-agent-gemma.onrender.com" : location.origin;
   const LS = {
     api: "hermes.api",
     user: "hermes.user",
