@@ -1466,9 +1466,6 @@ def delete_session(user_id: str, session_id: str):
     meta = get_sessions_collection()
     if meta is not None:
         meta.delete_many({"user_id": user_id, "session_id": session_id})
-    docs = get_docs_collection()
-    if docs is not None:
-        docs.delete_many({"user_id": user_id, "session_id": session_id})
     return {"user_id": user_id, "session_id": session_id, "deleted_messages": deleted}
 
 
@@ -1578,18 +1575,12 @@ def delete_history(user_id: str, session_id: str | None = None):
         query["session_id"] = session_id
     deleted = col.delete_many(query).deleted_count
 
-    doc_query = {"user_id": user_id}
-    if session_id:
-        doc_query["session_id"] = session_id
-    docs = get_docs_collection()
-    docs_deleted = docs.delete_many(doc_query).deleted_count if docs is not None else 0
-
     meta = get_sessions_collection()
     sessions_deleted = meta.delete_many(query).deleted_count if meta is not None else 0
 
-    # Notes et rappels ne sont pas rattaches a un fil : on ne les purge
-    # que si l'on efface tout l'utilisateur.
-    notes_deleted = reminders_deleted = 0
+    # Notes, rappels et documents ne sont pas rattaches a un fil : on ne les
+    # purge que si l'on efface tout l'utilisateur.
+    notes_deleted = reminders_deleted = docs_deleted = 0
     if not session_id:
         notes = get_notes_collection()
         notes_deleted = notes.delete_many({"user_id": user_id}).deleted_count if notes is not None else 0
@@ -1597,6 +1588,8 @@ def delete_history(user_id: str, session_id: str | None = None):
         reminders_deleted = (
             reminders.delete_many({"user_id": user_id}).deleted_count if reminders is not None else 0
         )
+        docs = get_docs_collection()
+        docs_deleted = docs.delete_many({"user_id": user_id}).deleted_count if docs is not None else 0
 
     return {
         "user_id": user_id,
