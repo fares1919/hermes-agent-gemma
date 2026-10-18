@@ -1088,6 +1088,24 @@ def _need_memory():
     return col
 
 
+def _need_notes():
+    col = get_notes_collection()
+    if col is None:
+        raise HTTPException(
+            status_code=503, detail={"message": "Memoire indisponible", "error": _mongo_error}
+        )
+    return col
+
+
+def _need_reminders():
+    col = get_reminders_collection()
+    if col is None:
+        raise HTTPException(
+            status_code=503, detail={"message": "Memoire indisponible", "error": _mongo_error}
+        )
+    return col
+
+
 @app.get("/history/{user_id}")
 def history(user_id: str, limit: int = 10, session_id: str | None = None):
     col = _need_memory()
@@ -1155,7 +1173,7 @@ def delete_history(user_id: str, session_id: str | None = None):
 
 @app.get("/notes/{user_id}")
 def notes(user_id: str, limit: int = 50):
-    col = _need_memory()
+    col = _need_notes()
     docs = list(
         col.find({"user_id": user_id}, {"_id": 0, "note": 1, "created_at": 1})
         .sort("created_at", -1)
@@ -1166,7 +1184,7 @@ def notes(user_id: str, limit: int = 50):
 
 @app.get("/reminders/{user_id}")
 def reminders(user_id: str, limit: int = 50):
-    col = _need_memory()
+    col = _need_reminders()
     now = datetime.now(timezone.utc)
     docs = list(
         col.find({"user_id": user_id}).sort("due_at", 1).limit(max(1, min(limit, 200)))
@@ -1177,7 +1195,7 @@ def reminders(user_id: str, limit: int = 50):
 @app.get("/reminders/{user_id}/due")
 def reminders_due(user_id: str, limit: int = 20):
     """Rappels echus et pas encore signales : l'interface les affiche puis les acquitte."""
-    col = _need_memory()
+    col = _need_reminders()
     now = datetime.now(timezone.utc)
     docs = list(
         col.find({"user_id": user_id, "notified": False, "due_at": {"$lte": now}})
@@ -1189,7 +1207,7 @@ def reminders_due(user_id: str, limit: int = 20):
 
 @app.post("/reminders/ack")
 def reminders_ack(req: AckRequest):
-    col = _need_memory()
+    col = _need_reminders()
     result = col.update_many(
         {"user_id": req.user_id, "short_id": {"$in": req.ids}},
         {"$set": {"notified": True, "notified_at": datetime.now(timezone.utc)}},
@@ -1199,7 +1217,7 @@ def reminders_ack(req: AckRequest):
 
 @app.delete("/reminders/{user_id}/{reminder_id}")
 def delete_reminder(user_id: str, reminder_id: str):
-    col = _need_memory()
+    col = _need_reminders()
     deleted = col.delete_many({"user_id": user_id, "short_id": reminder_id}).deleted_count
     return {"deleted": deleted}
 
