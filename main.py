@@ -248,63 +248,49 @@ def call_llm(messages, tools=None):
     )
 
 
-def _consume(stream, emit):
-    """Lit un stream OpenAI et retourne (contenu, appels d'outils, finish_reason).
-    Les appels d'outils arrivent fragmentes : on les recolle par index."""
-    content = ""
-    calls = {}
-    finish = None
-    for chunk in stream:
-        choices = getattr(chunk, "choices", None)
-        if not choices:
-            continue
-        choice = choices[0]
-        delta = getattr(choice, "delta", None)
-        if delta is not None:
-            text = getattr(delta, "content", None)
-            if text:
-                content += text
-                emit(text)
-            for tc in getattr(delta, "tool_calls", None) or []:
-                slot = calls.setdefault(
-                    getattr(tc, "index", 0) or 0, {"id": "", "name": "", "arguments": ""}
-                )
-                if getattr(tc, "id", None):
-                    slot["id"] = tc.id
-                fn = getattr(tc, "function", None)
-                if fn is not None:
-                    if getattr(fn, "name", None):
-                        slot["name"] = slot["name"] + fn.name if slot["name"] else fn.name
-                    if getattr(fn, "arguments", None):
-                        slot["arguments"] += fn.arguments
-        if getattr(choice, "finish_reason", None):
-            finish = choice.finish_reason
-    return content, calls, finish
-
-
-def stream_once(messages, tools, on_text):
-    """Ouvre un stream chez le premier fournisseur disponible et le consomme.
-    Retourne (provider, model, contenu, appels_outils).
-    Si rien n'a encore ete diffuse, un echec permet de basculer."""
+def stream_once(messages, tools):
+    """Ouvre un stream chez le premier fournisseur disponible, diffuse chaque
+    fragment au client, et retourne (provider, model, contenu, appels_outils).
+    Tant que rien n'a ete diffuse, un echec permet de basculer de fournisseur."""
     last_exc = None
     for name in _order():
         kwargs = _kwargs(name, tools, stream=True)
         kwargs["messages"] = messages
-        emitted = {"done": False}
-
-        def emit(text, _e=emitted):
-            _e["done"] = True
-            on_text(text)
-
+        emitted = False
+        content = ""
+        calls = {}
         try:
             stream = get_client(name).chat.completions.create(**kwargs)
-            content, calls, _finish = _consume(stream, emit)
+            for chunk in stream:
+                choices = getattr(chunk, "choices", None)
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                if delta is not None:
+                    text = getattr(delta, "content", None)
+                    if text:
+                        content += text
+                        emitted = True
+                        yield ("delta", {"text": text})
+                    for tc in getattr(delta, "tool_calls", None) or []:
+                        slot = calls.setdefault(
+                            getattr(tc, "index", 0) or 0,
+                            {"id": "", "name": "", "arguments": ""},
+                        )
+                        if getattr(tc, "id", None):
+                            slot["id"] = tc.id
+                        fn = getattr(tc, "function", None)
+                        if fn is not None:
+                            if getattr(fn, "name", None):
+                                slot["name"] = slot["name"] + fn.name if slot["name"] else fn.name
+                            if getattr(fn, "arguments", None):
+                                slot["arguments"] += fn.arguments
             _ok(name)
             return name, PROVIDERS[name]["model"], content, calls
         except Exception as exc:  # noqa: BLE001
             _fail(name, exc)
             last_exc = exc
-            if emitted["done"]:
+            if emitted:
                 raise  # deja diffuse au client : plus de bascule possible
     raise RuntimeError(f"Aucun fournisseur disponible -> {last_exc}")
 
@@ -931,19 +917,16 @@ def agent_stream(messages, user_id, use_tools=True):
     """Variante streamee. Emet ('delta', ...), ('tool', ...), ('done', ...)."""
     active_tools = TOOL_SCHEMAS if (TOOLS_ENABLED and use_tools) else None
     used_tools = []
-    answer = []
+    parts = []
     provider_name = model_name = None
 
-    def on_text(chunk):
-        answer.append(chunk)
-
     for _ in range(MAX_TOOL_ITERATIONS):
-        name, model, content, calls = stream_once(messages, active_tools, on_text)
+        name, model, content, calls = yield from stream_once(messages, active_tools)
         provider_name, model_name = name, model
+        if content:
+            parts.append(content.strip())
         if not calls:
-            yield ("done", {"answer": "".join(answer), "provider": provider_name,
-                            "model": model_name, "tools_used": used_tools})
-            return
+            break
 
         messages.append(
             {
@@ -975,10 +958,22 @@ def agent_stream(messages, user_id, use_tools=True):
                     "content": str(result)[:6000],
                 }
             )
+    else:
+        # Budget d'outils epuise : on force une reponse finale sans outil.
+        name, model, content, _calls = yield from stream_once(messages, None)
+        provider_name, model_name = name, model
+        if content:
+            parts.append(content.strip())
 
-    name, model, _content, _calls = stream_once(messages, None, on_text)
-    yield ("done", {"answer": "".join(answer), "provider": name,
-                    "model": model, "tools_used": used_tools})
+    yield (
+        "done",
+        {
+            "answer": "\n\n".join(p for p in parts if p),
+            "provider": provider_name,
+            "model": model_name,
+            "tools_used": used_tools,
+        },
+    )
 
 
 # ------------------------------ Endpoints ---------------------------------
