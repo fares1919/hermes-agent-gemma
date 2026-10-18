@@ -1,4 +1,5 @@
 import ast
+import html as htmlmod
 import ipaddress
 import json
 import math
@@ -9,11 +10,12 @@ import socket
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, StreamingResponse
 from openai import OpenAI
 from pydantic import BaseModel
 from pymongo import MongoClient
@@ -23,7 +25,9 @@ CHAT_UI_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "chat.ht
 
 DEFAULT_SYSTEM = (
     "Tu es Hermes Agent, un assistant expert en automatisation. "
-    "Tu disposes d'outils : utilise-les quand c'est utile (heure, calculs, notes, lecture de page web). "
+    "Tu disposes d'outils : utilise-les quand c'est utile (heure, calculs, notes, rappels, "
+    "recherche web, lecture de page). Ne pretends jamais avoir fait une recherche ou "
+    "enregistre une note sans avoir appele l'outil correspondant. "
     "Reponds en francais de facon concise et utile."
 )
 
@@ -61,6 +65,7 @@ MEMORY_TURNS = int(os.getenv("MEMORY_TURNS", "10"))
 MONGO_DB = os.getenv("MONGO_DB", "hermes")
 MONGO_COLLECTION = os.getenv("MONGO_COLLECTION", "messages")
 MONGO_NOTES_COLLECTION = os.getenv("MONGO_NOTES_COLLECTION", "notes")
+MONGO_REMINDERS_COLLECTION = os.getenv("MONGO_REMINDERS_COLLECTION", "reminders")
 MONGO_TIMEOUT_MS = int(os.getenv("MONGO_TIMEOUT_MS", "4000"))
 MONGO_RETRY_SECONDS = float(os.getenv("MONGO_RETRY_SECONDS", "60"))
 
@@ -74,8 +79,19 @@ _mongo_retry_after = 0.0
 # Skills (function calling)
 # --------------------------------------------------------------------------
 TOOLS_ENABLED = os.getenv("TOOLS_ENABLED", "true").lower() in ("1", "true", "yes", "on")
-MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "4"))
+MAX_TOOL_ITERATIONS = int(os.getenv("MAX_TOOL_ITERATIONS", "5"))
 WEB_FETCH_MAX_CHARS = int(os.getenv("WEB_FETCH_MAX_CHARS", "4000"))
+
+# Recherche web : un fournisseur a cle si disponible, sinon DuckDuckGo (sans cle).
+SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "auto").strip().lower()
+SEARCH_API_KEY = os.getenv("SEARCH_API_KEY")
+SEARXNG_URL = os.getenv("SEARXNG_URL")
+SEARCH_MAX_RESULTS = int(os.getenv("SEARCH_MAX_RESULTS", "5"))
+SEARCH_TIMEOUT = float(os.getenv("SEARCH_TIMEOUT", "20"))
+USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0 Safari/537.36"
+)
 
 app = FastAPI(title="Hermes Agent - multi-provider + memory + skills")
 app.add_middleware(
@@ -93,7 +109,22 @@ def _mask(secret):
     return secret[:6] + "****" + secret[-4:] if len(secret) > 12 else "****"
 
 
+def _iso(value):
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.isoformat()
+    return None if value is None else str(value)
+
+
+def _as_utc(value):
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    return None
+
+
 # ------------------------------- Mongo ------------------------------------
+
 
 def get_collection():
     """Retourne la collection Mongo, ou None si indisponible.
@@ -131,14 +162,23 @@ def get_collection():
     return _collection
 
 
-def get_notes_collection():
+def _sibling_collection(name):
     col = get_collection()
     if col is None:
         return None
-    return col.database[MONGO_NOTES_COLLECTION]
+    return col.database[name]
+
+
+def get_notes_collection():
+    return _sibling_collection(MONGO_NOTES_COLLECTION)
+
+
+def get_reminders_collection():
+    return _sibling_collection(MONGO_REMINDERS_COLLECTION)
 
 
 # ----------------------------- Providers ----------------------------------
+
 
 def get_client(name):
     cfg = PROVIDERS[name]
@@ -151,42 +191,122 @@ def get_client(name):
     return _clients[name]
 
 
-def call_llm(messages, tools=None):
-    """Essaie les fournisseurs dans l'ordre, avec mise en quarantaine des
-    fournisseurs en echec (circuit breaker en memoire)."""
+def _order():
+    """Fournisseurs disponibles, les sains d'abord, puis ceux en quarantaine
+    (du plus proche de la sortie au plus lointain) : on tente toujours tout."""
     now = time.time()
-    order = [p for p in PROVIDER_ORDER if p in PROVIDERS]
-    ready = [p for p in order if _state[p]["cooldown_until"] <= now]
+    listed = [p for p in PROVIDER_ORDER if p in PROVIDERS]
+    ready = [p for p in listed if _state[p]["cooldown_until"] <= now]
     cooling = sorted(
-        [p for p in order if _state[p]["cooldown_until"] > now],
+        [p for p in listed if _state[p]["cooldown_until"] > now],
         key=lambda p: _state[p]["cooldown_until"],
     )
+    return ready + cooling
+
+
+def _ok(name):
+    _state[name].update(
+        cooldown_until=0.0, last_error=None, last_ok=datetime.now(timezone.utc).isoformat()
+    )
+
+
+def _fail(name, exc):
+    _state[name].update(
+        cooldown_until=time.time() + COOLDOWN_SECONDS, last_error=str(exc)[:300]
+    )
+
+
+def _kwargs(name, tools, stream):
+    cfg = PROVIDERS[name]
+    kwargs = {
+        "model": cfg["model"],
+        "temperature": 0.7,
+    }
+    if stream:
+        kwargs["stream"] = True
+    if tools:
+        kwargs["tools"] = tools
+        kwargs["tool_choice"] = "auto"
+    return kwargs
+
+
+def call_llm(messages, tools=None):
+    """Version non streamee : essaie les fournisseurs dans l'ordre."""
     errors = []
-    for name in ready + cooling:
-        cfg = PROVIDERS[name]
-        kwargs = {"model": cfg["model"], "messages": messages, "temperature": 0.7}
-        if tools:
-            kwargs["tools"] = tools
-            kwargs["tool_choice"] = "auto"
+    for name in _order():
+        kwargs = _kwargs(name, tools, stream=False)
+        kwargs["messages"] = messages
         try:
-            client = get_client(name)
-            completion = client.chat.completions.create(**kwargs)
-            _state[name].update(
-                cooldown_until=0.0,
-                last_error=None,
-                last_ok=datetime.now(timezone.utc).isoformat(),
-            )
-            return completion.choices[0].message, name, cfg["model"]
+            completion = get_client(name).chat.completions.create(**kwargs)
+            _ok(name)
+            return completion.choices[0].message, name, PROVIDERS[name]["model"]
         except Exception as exc:  # noqa: BLE001 - on veut basculer sur tout echec
-            _state[name].update(
-                cooldown_until=time.time() + COOLDOWN_SECONDS,
-                last_error=str(exc)[:300],
-            )
+            _fail(name, exc)
             errors.append(f"{name}: {exc}")
     raise HTTPException(
-        status_code=502,
-        detail="Aucun fournisseur disponible -> " + " | ".join(errors),
+        status_code=502, detail="Aucun fournisseur disponible -> " + " | ".join(errors)
     )
+
+
+def _consume(stream, emit):
+    """Lit un stream OpenAI et retourne (contenu, appels d'outils, finish_reason).
+    Les appels d'outils arrivent fragmentes : on les recolle par index."""
+    content = ""
+    calls = {}
+    finish = None
+    for chunk in stream:
+        choices = getattr(chunk, "choices", None)
+        if not choices:
+            continue
+        choice = choices[0]
+        delta = getattr(choice, "delta", None)
+        if delta is not None:
+            text = getattr(delta, "content", None)
+            if text:
+                content += text
+                emit(text)
+            for tc in getattr(delta, "tool_calls", None) or []:
+                slot = calls.setdefault(
+                    getattr(tc, "index", 0) or 0, {"id": "", "name": "", "arguments": ""}
+                )
+                if getattr(tc, "id", None):
+                    slot["id"] = tc.id
+                fn = getattr(tc, "function", None)
+                if fn is not None:
+                    if getattr(fn, "name", None):
+                        slot["name"] = slot["name"] + fn.name if slot["name"] else fn.name
+                    if getattr(fn, "arguments", None):
+                        slot["arguments"] += fn.arguments
+        if getattr(choice, "finish_reason", None):
+            finish = choice.finish_reason
+    return content, calls, finish
+
+
+def stream_once(messages, tools, on_text):
+    """Ouvre un stream chez le premier fournisseur disponible et le consomme.
+    Retourne (provider, model, contenu, appels_outils).
+    Si rien n'a encore ete diffuse, un echec permet de basculer."""
+    last_exc = None
+    for name in _order():
+        kwargs = _kwargs(name, tools, stream=True)
+        kwargs["messages"] = messages
+        emitted = {"done": False}
+
+        def emit(text, _e=emitted):
+            _e["done"] = True
+            on_text(text)
+
+        try:
+            stream = get_client(name).chat.completions.create(**kwargs)
+            content, calls, _finish = _consume(stream, emit)
+            _ok(name)
+            return name, PROVIDERS[name]["model"], content, calls
+        except Exception as exc:  # noqa: BLE001
+            _fail(name, exc)
+            last_exc = exc
+            if emitted["done"]:
+                raise  # deja diffuse au client : plus de bascule possible
+    raise RuntimeError(f"Aucun fournisseur disponible -> {last_exc}")
 
 
 # ------------------------------- Skills -----------------------------------
@@ -202,19 +322,9 @@ _ALLOWED_BINOPS = {
 }
 _ALLOWED_UNARY = {ast.USub: operator.neg, ast.UAdd: operator.pos}
 _MATH_NAMES = {
-    "sqrt": math.sqrt,
-    "abs": abs,
-    "round": round,
-    "floor": math.floor,
-    "ceil": math.ceil,
-    "log": math.log,
-    "log10": math.log10,
-    "exp": math.exp,
-    "sin": math.sin,
-    "cos": math.cos,
-    "tan": math.tan,
-    "pi": math.pi,
-    "e": math.e,
+    "sqrt": math.sqrt, "abs": abs, "round": round, "floor": math.floor,
+    "ceil": math.ceil, "log": math.log, "log10": math.log10, "exp": math.exp,
+    "sin": math.sin, "cos": math.cos, "tan": math.tan, "pi": math.pi, "e": math.e,
 }
 
 
@@ -237,6 +347,7 @@ def _eval_ast(node):
 
 
 def _is_public_host(host):
+    """Refuse localhost et les plages privees (garde-fou SSRF basique)."""
     try:
         infos = socket.getaddrinfo(host, None)
     except Exception:  # noqa: BLE001
@@ -249,6 +360,12 @@ def _is_public_host(host):
         if ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_reserved or ip.is_multicast:
             return False
     return True
+
+
+def _strip_html(text):
+    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", text)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    return re.sub(r"\s+", " ", htmlmod.unescape(text)).strip()
 
 
 def tool_get_datetime(args):
@@ -288,15 +405,21 @@ def tool_save_note(args, user_id):
     notes.insert_one(
         {"user_id": user_id, "note": text[:2000], "created_at": datetime.now(timezone.utc)}
     )
-    total = notes.count_documents({"user_id": user_id})
-    return json.dumps({"saved": text[:2000], "total_notes": total}, ensure_ascii=False)
+    return json.dumps(
+        {"saved": text[:2000], "total_notes": notes.count_documents({"user_id": user_id})},
+        ensure_ascii=False,
+    )
 
 
 def tool_list_notes(args, user_id):
     notes = get_notes_collection()
     if notes is None:
         return "erreur: memoire indisponible"
-    docs = list(notes.find({"user_id": user_id}, {"_id": 0, "note": 1}).sort("created_at", -1).limit(20))
+    docs = list(
+        notes.find({"user_id": user_id}, {"_id": 0, "note": 1})
+        .sort("created_at", -1)
+        .limit(20)
+    )
     return json.dumps([d["note"] for d in docs], ensure_ascii=False)
 
 
@@ -308,15 +431,308 @@ def tool_web_fetch(args):
     if not parsed.hostname or not _is_public_host(parsed.hostname):
         return "erreur: hote non autorise"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "HermesAgent/1.0"})
-        with urllib.request.urlopen(req, timeout=15) as resp:  # noqa: S310
-            raw = resp.read(400000).decode("utf-8", "replace")
+        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310
+            raw = resp.read(400000)
+            charset = resp.headers.get_content_charset() or "utf-8"
     except Exception as exc:  # noqa: BLE001
         return f"erreur: {exc}"
-    text = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", raw)
-    text = re.sub(r"(?s)<[^>]+>", " ", text)
-    text = re.sub(r"\s+", " ", text).strip()
-    return text[:WEB_FETCH_MAX_CHARS]
+    try:
+        text = raw.decode(charset, "replace")
+    except LookupError:
+        text = raw.decode("utf-8", "replace")
+    return _strip_html(text)[:WEB_FETCH_MAX_CHARS]
+
+
+# ------------------------------ Recherche web -----------------------------
+
+DDG_LINK_RE = re.compile(
+    r"<a[^>]*href=\"([^\"]+)\"[^>]*class=['\"]result-link['\"][^>]*>(.*?)</a>", re.S | re.I
+)
+DDG_SNIP_RE = re.compile(r"class=['\"]result-snippet['\"][^>]*>(.*?)</td>", re.S | re.I)
+
+
+def _http_get(url, headers=None, timeout=None):
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": USER_AGENT,
+            "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+            **(headers or {}),
+        },
+    )
+    with urllib.request.urlopen(req, timeout=timeout or SEARCH_TIMEOUT) as resp:  # noqa: S310
+        raw = resp.read(600000)
+        charset = resp.headers.get_content_charset() or "utf-8"
+    try:
+        return raw.decode(charset)
+    except (UnicodeDecodeError, LookupError):
+        try:
+            return raw.decode("utf-8")
+        except UnicodeDecodeError:
+            return raw.decode("cp1252", "replace")
+
+
+def _http_post_json(url, payload, headers=None):
+    req = urllib.request.Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json", "User-Agent": USER_AGENT, **(headers or {})},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=SEARCH_TIMEOUT) as resp:  # noqa: S310
+        return json.loads(resp.read().decode("utf-8", "replace"))
+
+
+def _clean_ddg_url(href):
+    href = htmlmod.unescape(href)
+    if href.startswith("//"):
+        href = "https:" + href
+    match = re.search(r"[?&]uddg=([^&]+)", href)
+    if match:
+        return urllib.parse.unquote(match.group(1))
+    return href
+
+
+def search_duckduckgo(query, limit):
+    doc = _http_get("https://lite.duckduckgo.com/lite/?q=" + urllib.parse.quote_plus(query))
+    links = DDG_LINK_RE.findall(doc)
+    snippets = DDG_SNIP_RE.findall(doc)
+    out = []
+    for index, (href, title) in enumerate(links[:limit]):
+        out.append(
+            {
+                "titre": _strip_html(title),
+                "url": _clean_ddg_url(href),
+                "extrait": _strip_html(snippets[index]) if index < len(snippets) else "",
+            }
+        )
+    return out
+
+
+def search_brave(query, limit):
+    data = json.loads(
+        _http_get(
+            "https://api.search.brave.com/res/v1/web/search?"
+            + urllib.parse.urlencode({"q": query, "count": limit}),
+            headers={"X-Subscription-Token": SEARCH_API_KEY or "", "Accept": "application/json"},
+        )
+    )
+    return [
+        {
+            "titre": item.get("title", ""),
+            "url": item.get("url", ""),
+            "extrait": _strip_html(item.get("description", "")),
+        }
+        for item in (data.get("web", {}) or {}).get("results", [])[:limit]
+    ]
+
+
+def search_tavily(query, limit):
+    data = _http_post_json(
+        "https://api.tavily.com/search",
+        {
+            "api_key": SEARCH_API_KEY,
+            "query": query,
+            "max_results": limit,
+            "search_depth": "basic",
+        },
+    )
+    return [
+        {"titre": r.get("title", ""), "url": r.get("url", ""), "extrait": r.get("content", "")}
+        for r in (data.get("results") or [])[:limit]
+    ]
+
+
+def search_serper(query, limit):
+    data = _http_post_json(
+        "https://google.serper.dev/search",
+        {"q": query, "num": limit},
+        headers={"X-API-KEY": SEARCH_API_KEY or ""},
+    )
+    return [
+        {
+            "titre": r.get("title", ""),
+            "url": r.get("link", ""),
+            "extrait": r.get("snippet", ""),
+        }
+        for r in (data.get("organic") or [])[:limit]
+    ]
+
+
+def search_searxng(query, limit):
+    data = json.loads(
+        _http_get(
+            (SEARXNG_URL or "").rstrip("/")
+            + "/search?"
+            + urllib.parse.urlencode({"q": query, "format": "json"}),
+            headers={"Accept": "application/json"},
+        )
+    )
+    return [
+        {"titre": r.get("title", ""), "url": r.get("url", ""), "extrait": r.get("content", "")}
+        for r in (data.get("results") or [])[:limit]
+    ]
+
+
+SEARCH_BACKENDS = {
+    "brave": search_brave,
+    "tavily": search_tavily,
+    "serper": search_serper,
+    "searxng": search_searxng,
+    "duckduckgo": search_duckduckgo,
+}
+
+
+def _search_chain():
+    """Ordre des moteurs : celui demande s'il y a une cle, sinon les moteurs
+    sans cle (SearXNG si configure, puis DuckDuckGo)."""
+    if SEARCH_PROVIDER in SEARCH_BACKENDS and SEARCH_PROVIDER != "auto":
+        if SEARCH_PROVIDER in ("duckduckgo", "searxng") or SEARCH_API_KEY:
+            chain = [SEARCH_PROVIDER]
+        else:
+            chain = []
+    elif SEARCH_API_KEY:
+        chain = ["brave", "tavily", "serper"]
+    else:
+        chain = []
+    if SEARXNG_URL:
+        chain.append("searxng")
+    chain.append("duckduckgo")
+    seen = []
+    for name in chain:
+        if name not in seen:
+            seen.append(name)
+    return seen
+
+
+def active_search_backend():
+    return _search_chain()[0]
+
+
+def tool_web_search(args):
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return "erreur: requete vide"
+    limit = int(args.get("max_results") or SEARCH_MAX_RESULTS)
+    limit = max(1, min(limit, 10))
+    errors = []
+    for backend in _search_chain():
+        try:
+            results = SEARCH_BACKENDS[backend](query, limit)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(f"{backend}: {exc}")
+            continue
+        if results:
+            return json.dumps(
+                {"requete": query, "moteur": backend, "resultats": results},
+                ensure_ascii=False,
+            )
+        errors.append(f"{backend}: aucun resultat")
+    return json.dumps({"requete": query, "erreur": " | ".join(errors)}, ensure_ascii=False)
+
+
+# ------------------------------- Rappels ----------------------------------
+
+
+def _parse_when(raw):
+    text = str(raw or "").strip()
+    if not text:
+        raise ValueError("date manquante")
+    candidate = text.replace("Z", "+00:00").replace("z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError:
+        parsed = None
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S",
+                    "%Y-%m-%dT%H:%M", "%d/%m/%Y %H:%M", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(text, fmt)
+                break
+            except ValueError:
+                continue
+        if parsed is None:
+            raise ValueError(f"format de date non reconnu: {text}")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _reminder_out(doc, now):
+    due = _as_utc(doc.get("due_at"))
+    return {
+        "id": doc.get("short_id"),
+        "text": doc.get("text"),
+        "due_at": _iso(due),
+        "dans_s": round((due - now).total_seconds()) if due else None,
+        "notifie": bool(doc.get("notified")),
+        "cree_le": _iso(_as_utc(doc.get("created_at"))),
+    }
+
+
+def tool_set_reminder(args, user_id):
+    col = get_reminders_collection()
+    if col is None:
+        return "erreur: memoire indisponible"
+    text = str(args.get("text", "")).strip()
+    if not text:
+        return "erreur: texte du rappel vide"
+    now = datetime.now(timezone.utc)
+    try:
+        if args.get("in_minutes") is not None:
+            due = now + timedelta(minutes=float(args["in_minutes"]))
+        else:
+            due = _parse_when(args.get("when"))
+    except (ValueError, TypeError) as exc:
+        return f"erreur: {exc}"
+    if due < now - timedelta(minutes=5):
+        return json.dumps(
+            {"erreur": "cette date est deja passee", "maintenant_utc": now.isoformat()},
+            ensure_ascii=False,
+        )
+    short_id = uuid.uuid4().hex[:8]
+    col.insert_one(
+        {
+            "short_id": short_id,
+            "user_id": user_id,
+            "text": text[:1000],
+            "due_at": due,
+            "notified": False,
+            "created_at": now,
+        }
+    )
+    return json.dumps(
+        {
+            "id": short_id,
+            "text": text[:1000],
+            "due_at_utc": due.isoformat(),
+            "dans_minutes": round((due - now).total_seconds() / 60),
+            "note": "le rappel sera signale a l'ouverture de l'interface",
+        },
+        ensure_ascii=False,
+    )
+
+
+def tool_list_reminders(args, user_id):
+    col = get_reminders_collection()
+    if col is None:
+        return "erreur: memoire indisponible"
+    now = datetime.now(timezone.utc)
+    docs = list(
+        col.find({"user_id": user_id, "notified": False}).sort("due_at", 1).limit(30)
+    )
+    return json.dumps([_reminder_out(d, now) for d in docs], ensure_ascii=False)
+
+
+def tool_cancel_reminder(args, user_id):
+    col = get_reminders_collection()
+    if col is None:
+        return "erreur: memoire indisponible"
+    short_id = str(args.get("id", "")).strip()
+    if not short_id:
+        return "erreur: identifiant manquant"
+    deleted = col.delete_many({"user_id": user_id, "short_id": short_id}).deleted_count
+    return json.dumps({"annule": deleted}, ensure_ascii=False)
 
 
 def execute_tool(name, args, user_id):
@@ -325,12 +741,20 @@ def execute_tool(name, args, user_id):
             return tool_get_datetime(args)
         if name == "calculate":
             return tool_calculate(args)
+        if name == "web_search":
+            return tool_web_search(args)
+        if name == "web_fetch":
+            return tool_web_fetch(args)
         if name == "save_note":
             return tool_save_note(args, user_id)
         if name == "list_notes":
             return tool_list_notes(args, user_id)
-        if name == "web_fetch":
-            return tool_web_fetch(args)
+        if name == "set_reminder":
+            return tool_set_reminder(args, user_id)
+        if name == "list_reminders":
+            return tool_list_reminders(args, user_id)
+        if name == "cancel_reminder":
+            return tool_cancel_reminder(args, user_id)
         return f"erreur: outil inconnu '{name}'"
     except Exception as exc:  # noqa: BLE001
         return f"erreur: {exc}"
@@ -341,7 +765,7 @@ TOOL_SCHEMAS = [
         "type": "function",
         "function": {
             "name": "get_datetime",
-            "description": "Renvoie la date et l'heure actuelles.",
+            "description": "Renvoie la date et l'heure actuelles. A appeler avant tout calcul de date.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -361,8 +785,37 @@ TOOL_SCHEMAS = [
             "description": "Calcule une expression mathematique (+, -, *, /, **, sqrt, log...).",
             "parameters": {
                 "type": "object",
-                "properties": {"expression": {"type": "string", "description": "Ex: (1200*0.19)+45"}},
+                "properties": {
+                    "expression": {"type": "string", "description": "Ex: (1200*0.19)+45"}
+                },
                 "required": ["expression"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_search",
+            "description": "Recherche des informations actuelles sur le web et renvoie des titres, URL et extraits.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string", "description": "Mots-cles de recherche."},
+                    "max_results": {"type": "integer", "description": "Nombre de resultats (1-10, defaut 5)."},
+                },
+                "required": ["query"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "web_fetch",
+            "description": "Recupere le texte complet d'une page web publique (http/https).",
+            "parameters": {
+                "type": "object",
+                "properties": {"url": {"type": "string"}},
+                "required": ["url"],
             },
         },
     },
@@ -389,12 +842,41 @@ TOOL_SCHEMAS = [
     {
         "type": "function",
         "function": {
-            "name": "web_fetch",
-            "description": "Recupere le texte d'une page web publique (http/https).",
+            "name": "set_reminder",
+            "description": (
+                "Programme un rappel pour l'utilisateur courant. "
+                "Appelle d'abord get_datetime pour connaitre l'heure courante, "
+                "puis donne 'when' en ISO 8601 AVEC decalage (ex: 2026-10-19T09:00:00+01:00) "
+                "ou utilise 'in_minutes' pour un delai relatif."
+            ),
             "parameters": {
                 "type": "object",
-                "properties": {"url": {"type": "string"}},
-                "required": ["url"],
+                "properties": {
+                    "text": {"type": "string", "description": "Ce qu'il faut rappeler."},
+                    "when": {"type": "string", "description": "Date/heure ISO 8601 avec decalage horaire."},
+                    "in_minutes": {"type": "number", "description": "Delai relatif en minutes."},
+                },
+                "required": ["text"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_reminders",
+            "description": "Liste les rappels a venir de l'utilisateur courant.",
+            "parameters": {"type": "object", "properties": {}, "required": []},
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "cancel_reminder",
+            "description": "Annule un rappel a partir de son identifiant.",
+            "parameters": {
+                "type": "object",
+                "properties": {"id": {"type": "string"}},
+                "required": ["id"],
             },
         },
     },
@@ -403,8 +885,19 @@ TOOL_SCHEMAS = [
 TOOL_NAMES = [t["function"]["name"] for t in TOOL_SCHEMAS]
 
 
+# ---------------------- Boucle d'agent (fonction calling) -----------------
+
+
+def _tool_call_payload(tc):
+    return {
+        "id": tc.id,
+        "type": "function",
+        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
+    }
+
+
 def run_agent(messages, user_id, use_tools=True):
-    """Boucle d'appel d'outils : tant que le modele demande un outil, on l'execute."""
+    """Boucle synchrone : le modele demande un outil, on l'execute, on recommence."""
     used_tools = []
     provider_name = model_name = None
     active_tools = TOOL_SCHEMAS if (TOOLS_ENABLED and use_tools) else None
@@ -414,19 +907,11 @@ def run_agent(messages, user_id, use_tools=True):
         tool_calls = getattr(msg, "tool_calls", None)
         if not tool_calls:
             return msg.content or "", provider_name, model_name, used_tools
-
         messages.append(
             {
                 "role": "assistant",
                 "content": msg.content or "",
-                "tool_calls": [
-                    {
-                        "id": tc.id,
-                        "type": "function",
-                        "function": {"name": tc.function.name, "arguments": tc.function.arguments},
-                    }
-                    for tc in tool_calls
-                ],
+                "tool_calls": [_tool_call_payload(tc) for tc in tool_calls],
             }
         )
         for tc in tool_calls:
@@ -436,15 +921,68 @@ def run_agent(messages, user_id, use_tools=True):
                 args = {}
             result = execute_tool(tc.function.name, args, user_id)
             used_tools.append({"tool": tc.function.name, "arguments": args})
-            messages.append(
-                {"role": "tool", "tool_call_id": tc.id, "content": str(result)[:6000]}
-            )
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": str(result)[:6000]})
 
     msg, provider_name, model_name = call_llm(messages, tools=None)
     return msg.content or "", provider_name, model_name, used_tools
 
 
+def agent_stream(messages, user_id, use_tools=True):
+    """Variante streamee. Emet ('delta', ...), ('tool', ...), ('done', ...)."""
+    active_tools = TOOL_SCHEMAS if (TOOLS_ENABLED and use_tools) else None
+    used_tools = []
+    answer = []
+    provider_name = model_name = None
+
+    def on_text(chunk):
+        answer.append(chunk)
+
+    for _ in range(MAX_TOOL_ITERATIONS):
+        name, model, content, calls = stream_once(messages, active_tools, on_text)
+        provider_name, model_name = name, model
+        if not calls:
+            yield ("done", {"answer": "".join(answer), "provider": provider_name,
+                            "model": model_name, "tools_used": used_tools})
+            return
+
+        messages.append(
+            {
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [
+                    {
+                        "id": calls[i]["id"] or f"call_{i}",
+                        "type": "function",
+                        "function": {"name": calls[i]["name"], "arguments": calls[i]["arguments"] or "{}"},
+                    }
+                    for i in sorted(calls)
+                ],
+            }
+        )
+        for i in sorted(calls):
+            tool_name = calls[i]["name"]
+            try:
+                args = json.loads(calls[i]["arguments"] or "{}")
+            except Exception:  # noqa: BLE001
+                args = {}
+            yield ("tool", {"tool": tool_name, "arguments": args})
+            result = execute_tool(tool_name, args, user_id)
+            used_tools.append({"tool": tool_name, "arguments": args})
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": calls[i]["id"] or f"call_{i}",
+                    "content": str(result)[:6000],
+                }
+            )
+
+    name, model, _content, _calls = stream_once(messages, None, on_text)
+    yield ("done", {"answer": "".join(answer), "provider": name,
+                    "model": model, "tools_used": used_tools})
+
+
 # ------------------------------ Endpoints ---------------------------------
+
 
 class ChatRequest(BaseModel):
     prompt: str
@@ -452,6 +990,11 @@ class ChatRequest(BaseModel):
     session_id: str = "default"
     system: str = DEFAULT_SYSTEM
     use_tools: bool = True
+
+
+class AckRequest(BaseModel):
+    user_id: str
+    ids: list[str] = []
 
 
 _chat_ui_cache = None
@@ -480,14 +1023,20 @@ def home():
         "storage_configured": bool(MONGO_URI),
         "tools_enabled": TOOLS_ENABLED,
         "tools": TOOL_NAMES,
+        "search_backend": active_search_backend(),
+        "search_configured": bool(SEARCH_API_KEY or SEARXNG_URL),
         "provider_order": [p for p in PROVIDER_ORDER if p in PROVIDERS],
         "models": {n: PROVIDERS[n]["model"] for n in PROVIDER_ORDER if n in PROVIDERS},
     }
 
 
 @app.get("/tools")
-def tools():
-    return {"enabled": TOOLS_ENABLED, "tools": TOOL_SCHEMAS}
+def tools_list():
+    return {
+        "enabled": TOOLS_ENABLED,
+        "search_backend": active_search_backend(),
+        "tools": TOOL_SCHEMAS,
+    }
 
 
 @app.get("/providers")
@@ -535,97 +1084,189 @@ def health_db():
     return info
 
 
-@app.get("/history/{user_id}")
-def history(user_id: str, limit: int = 10):
+def _need_memory():
     col = get_collection()
     if col is None:
         raise HTTPException(
             status_code=503, detail={"message": "Memoire indisponible", "error": _mongo_error}
         )
+    return col
+
+
+@app.get("/history/{user_id}")
+def history(user_id: str, limit: int = 10, session_id: str | None = None):
+    col = _need_memory()
+    query = {"user_id": user_id}
+    if session_id:
+        query["session_id"] = session_id
     docs = list(
-        col.find({"user_id": user_id}, {"_id": 0})
-        .sort("created_at", -1)
-        .limit(max(1, min(limit, 100)))
+        col.find(query, {"_id": 0}).sort("created_at", -1).limit(max(1, min(limit, 100)))
     )
-    return {"user_id": user_id, "count": len(docs), "messages": docs}
+    return {"user_id": user_id, "session_id": session_id, "count": len(docs), "messages": docs}
+
+
+@app.get("/sessions/{user_id}")
+def sessions(user_id: str, limit: int = 50):
+    """Fils de discussion de l'utilisateur, du plus recent au plus ancien."""
+    col = _need_memory()
+    pipeline = [
+        {"$match": {"user_id": user_id}},
+        {"$sort": {"created_at": 1}},
+        {
+            "$group": {
+                "_id": "$session_id",
+                "messages": {"$sum": 1},
+                "first_prompt": {"$first": "$prompt"},
+                "last_prompt": {"$last": "$prompt"},
+                "last_at": {"$max": "$created_at"},
+            }
+        },
+        {"$sort": {"last_at": -1}},
+        {"$limit": max(1, min(limit, 200))},
+    ]
+    out = [
+        {
+            "session_id": row.get("_id") or "default",
+            "messages": row.get("messages", 0),
+            "titre": (row.get("first_prompt") or row.get("last_prompt") or "")[:90],
+            "last_prompt": (row.get("last_prompt") or "")[:90],
+            "last_at": _iso(_as_utc(row.get("last_at"))),
+        }
+        for row in col.aggregate(pipeline)
+    ]
+    return {"user_id": user_id, "count": len(out), "sessions": out}
 
 
 @app.delete("/history/{user_id}")
 def delete_history(user_id: str, session_id: str | None = None):
-    col = get_collection()
-    if col is None:
-        raise HTTPException(
-            status_code=503, detail={"message": "Memoire indisponible", "error": _mongo_error}
-        )
+    col = _need_memory()
     query = {"user_id": user_id}
     if session_id:
         query["session_id"] = session_id
     deleted = col.delete_many(query).deleted_count
     notes = get_notes_collection()
-    notes_deleted = 0
-    if notes is not None:
-        notes_deleted = notes.delete_many({"user_id": user_id}).deleted_count
-    return {"user_id": user_id, "deleted_messages": deleted, "deleted_notes": notes_deleted}
+    notes_deleted = notes.delete_many({"user_id": user_id}).deleted_count if notes is not None else 0
+    reminders = get_reminders_collection()
+    reminders_deleted = (
+        reminders.delete_many({"user_id": user_id}).deleted_count if reminders is not None else 0
+    )
+    return {
+        "user_id": user_id,
+        "deleted_messages": deleted,
+        "deleted_notes": notes_deleted,
+        "deleted_reminders": reminders_deleted,
+    }
 
 
 @app.get("/notes/{user_id}")
 def notes(user_id: str, limit: int = 50):
-    notes_col = get_notes_collection()
-    if notes_col is None:
-        raise HTTPException(
-            status_code=503, detail={"message": "Memoire indisponible", "error": _mongo_error}
-        )
+    col = _need_memory()
     docs = list(
-        notes_col.find({"user_id": user_id}, {"_id": 0, "note": 1, "created_at": 1})
+        col.find({"user_id": user_id}, {"_id": 0, "note": 1, "created_at": 1})
         .sort("created_at", -1)
         .limit(max(1, min(limit, 200)))
     )
     return {"user_id": user_id, "count": len(docs), "notes": docs}
 
 
-@app.post("/chat")
-def chat(req: ChatRequest):
-    col = get_collection()
-    history_docs = []
-    if col is not None:
-        try:
-            history_docs = list(
-                col.find({"user_id": req.user_id, "session_id": req.session_id}, {"_id": 0})
-                .sort("created_at", -1)
-                .limit(MEMORY_TURNS)
-            )
-            history_docs.reverse()
-        except Exception:  # noqa: BLE001 - la memoire ne doit pas casser le chat
-            history_docs = []
+@app.get("/reminders/{user_id}")
+def reminders(user_id: str, limit: int = 50):
+    col = _need_memory()
+    now = datetime.now(timezone.utc)
+    docs = list(
+        col.find({"user_id": user_id}).sort("due_at", 1).limit(max(1, min(limit, 200)))
+    )
+    return {"user_id": user_id, "count": len(docs), "reminders": [_reminder_out(d, now) for d in docs]}
 
+
+@app.get("/reminders/{user_id}/due")
+def reminders_due(user_id: str, limit: int = 20):
+    """Rappels echus et pas encore signales : l'interface les affiche puis les acquitte."""
+    col = _need_memory()
+    now = datetime.now(timezone.utc)
+    docs = list(
+        col.find({"user_id": user_id, "notified": False, "due_at": {"$lte": now}})
+        .sort("due_at", 1)
+        .limit(max(1, min(limit, 50)))
+    )
+    return {"user_id": user_id, "count": len(docs), "due": [_reminder_out(d, now) for d in docs]}
+
+
+@app.post("/reminders/ack")
+def reminders_ack(req: AckRequest):
+    col = _need_memory()
+    result = col.update_many(
+        {"user_id": req.user_id, "short_id": {"$in": req.ids}},
+        {"$set": {"notified": True, "notified_at": datetime.now(timezone.utc)}},
+    )
+    return {"acked": result.modified_count}
+
+
+@app.delete("/reminders/{user_id}/{reminder_id}")
+def delete_reminder(user_id: str, reminder_id: str):
+    col = _need_memory()
+    deleted = col.delete_many({"user_id": user_id, "short_id": reminder_id}).deleted_count
+    return {"deleted": deleted}
+
+
+# ------------------------- Chat (non streame / streame) -------------------
+
+
+def _load_history(col, user_id, session_id):
+    if col is None:
+        return []
+    try:
+        docs = list(
+            col.find({"user_id": user_id, "session_id": session_id}, {"_id": 0})
+            .sort("created_at", -1)
+            .limit(MEMORY_TURNS)
+        )
+        docs.reverse()
+        return docs
+    except Exception:  # noqa: BLE001 - la memoire ne doit pas casser le chat
+        return []
+
+
+def _build_messages(history_docs, req):
     messages = [{"role": "system", "content": req.system}]
     for doc in history_docs:
         messages.append({"role": "user", "content": doc.get("prompt", "")})
         messages.append({"role": "assistant", "content": doc.get("response", "")})
     messages.append({"role": "user", "content": req.prompt})
+    return messages
+
+
+def _store(col, req, answer, provider_name, model_name, used_tools):
+    if col is None:
+        return False
+    try:
+        col.insert_one(
+            {
+                "user_id": req.user_id,
+                "session_id": req.session_id,
+                "prompt": req.prompt,
+                "response": answer,
+                "provider": provider_name,
+                "model": model_name,
+                "tools": [t["tool"] for t in used_tools],
+                "created_at": datetime.now(timezone.utc),
+            }
+        )
+        return True
+    except Exception:  # noqa: BLE001
+        return False
+
+
+@app.post("/chat")
+def chat(req: ChatRequest):
+    col = get_collection()
+    history_docs = _load_history(col, req.user_id, req.session_id)
+    messages = _build_messages(history_docs, req)
 
     answer, provider_name, model_name, used_tools = run_agent(
         messages, req.user_id, use_tools=req.use_tools
     )
-
-    stored = False
-    if col is not None:
-        try:
-            col.insert_one(
-                {
-                    "user_id": req.user_id,
-                    "session_id": req.session_id,
-                    "prompt": req.prompt,
-                    "response": answer,
-                    "provider": provider_name,
-                    "model": model_name,
-                    "tools": [t["tool"] for t in used_tools],
-                    "created_at": datetime.now(timezone.utc),
-                }
-            )
-            stored = True
-        except Exception:  # noqa: BLE001
-            stored = False
+    stored = _store(col, req, answer, provider_name, model_name, used_tools)
 
     return {
         "provider": provider_name,
@@ -637,3 +1278,58 @@ def chat(req: ChatRequest):
         "tools_used": used_tools,
         "response": answer,
     }
+
+
+def _sse(event, data):
+    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+
+@app.post("/chat/stream")
+def chat_stream(req: ChatRequest):
+    """Meme chose que /chat, mais en Server-Sent Events (reponse mot a mot)."""
+    col = get_collection()
+    history_docs = _load_history(col, req.user_id, req.session_id)
+    messages = _build_messages(history_docs, req)
+
+    def generate():
+        provider_name = model_name = None
+        used_tools = []
+        answer = ""
+        try:
+            yield _sse(
+                "meta",
+                {
+                    "memory_enabled": col is not None,
+                    "remembered_turns": len(history_docs),
+                    "tools_enabled": bool(TOOLS_ENABLED and req.use_tools),
+                },
+            )
+            for event, data in agent_stream(messages, req.user_id, req.use_tools):
+                if event == "done":
+                    answer = data["answer"]
+                    provider_name = data["provider"]
+                    model_name = data["model"]
+                    used_tools = data["tools_used"]
+                yield _sse(event, data)
+        except Exception as exc:  # noqa: BLE001
+            yield _sse("error", {"message": str(exc)[:500]})
+            return
+
+        stored = _store(col, req, answer, provider_name, model_name, used_tools)
+        yield _sse(
+            "end",
+            {
+                "stored": stored,
+                "fallback_used": provider_name != (PROVIDER_ORDER[0] if PROVIDER_ORDER else None),
+            },
+        )
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
