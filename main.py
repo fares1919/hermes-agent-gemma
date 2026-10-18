@@ -160,7 +160,7 @@ def home():
     return {
         "status": "live",
         "app": APP_NAME,
-        "memory": bool(MONGO_URI) and _index_ready,
+        "memory": "ready" if _index_ready else ("configured" if MONGO_URI else "off"),
         "storage_configured": bool(MONGO_URI),
         "provider_order": [p for p in PROVIDER_ORDER if p in PROVIDERS],
         "models": {n: PROVIDERS[n]["model"] for n in PROVIDER_ORDER if n in PROVIDERS},
