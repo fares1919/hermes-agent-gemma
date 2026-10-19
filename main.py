@@ -1,4 +1,5 @@
 import ast
+import hmac
 import html as htmlmod
 import io
 import ipaddress
@@ -14,9 +15,9 @@ import urllib.request
 import uuid
 from datetime import datetime, timedelta, timezone
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, StreamingResponse
+from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from openai import OpenAI
 from pydantic import BaseModel
 from pymongo import MongoClient
@@ -110,12 +111,133 @@ USER_AGENT = (
 )
 
 app = FastAPI(title="Hermes Agent - multi-provider + memory + skills")
+
+# --------------------------------------------------------------------------
+# Securite : cle d'acces, anti-abus, cloisonnement CORS
+# --------------------------------------------------------------------------
+# HERMES_TOKEN : si defini, toutes les routes de donnees l'exigent
+# (en-tete X-Hermes-Key ou Authorization: Bearer). Si absent, l'API reste
+# ouverte comme avant -> aucun risque de blocage total par erreur de config,
+# mais l'etat attendu en production est : token defini.
+HERMES_TOKEN = os.getenv("HERMES_TOKEN", "").strip()
+AUTH_ENABLED = bool(HERMES_TOKEN)
+
+# L'interface est servie par l'API elle-meme (meme origine) : par defaut on
+# n'autorise donc AUCUNE origine tierce. A renseigner seulement si vous
+# hebergez l'interface ailleurs.
+ALLOWED_ORIGINS = [o.strip() for o in os.getenv("ALLOWED_ORIGINS", "").split(",") if o.strip()]
+
+# Plafonds d'usage (par IP) pour eviter l'epuisement du quota LLM.
+RATE_LIMIT_PER_MIN = int(os.getenv("RATE_LIMIT_PER_MIN", "60"))
+RATE_LIMIT_CHAT_PER_MIN = int(os.getenv("RATE_LIMIT_CHAT_PER_MIN", "20"))
+# Plafonds de stockage par utilisateur (le MongoDB gratuit plafonne a 512 Mo).
+MAX_DOCS_PER_USER = int(os.getenv("MAX_DOCS_PER_USER", "50"))
+MAX_DOCS_BYTES_PER_USER = int(os.getenv("MAX_DOCS_BYTES_PER_USER", str(40 * 1024 * 1024)))
+# Render place le vrai client en dernier dans X-Forwarded-For.
+TRUST_PROXY = os.getenv("TRUST_PROXY", "true").lower() in ("1", "true", "yes", "on")
+
+PUBLIC_PATHS = {"/", "/ui"}
+
+_SECRETS_RE = re.compile(
+    r"(rv_[A-Za-z0-9_\-]{6,}|rnd_[A-Za-z0-9]{6,}|sk-[A-Za-z0-9_\-]{6,}"
+    r"|mongodb\+srv://[^\s\"']+|(?i:bearer)\s+[A-Za-z0-9_\-\.]{8,})"
+)
+
+
+def _scrub(text):
+    """Retire tout secret des messages destines a sortir de l'API."""
+    if not text:
+        return text
+    return _SECRETS_RE.sub("[masque]", str(text))
+
+
+def _token_ok(request):
+    provided = (request.headers.get("x-hermes-key") or "").strip()
+    if not provided:
+        parts = (request.headers.get("authorization") or "").split(None, 1)
+        if len(parts) == 2 and parts[0].lower() == "bearer":
+            provided = parts[1].strip()
+    if not provided:
+        return False
+    return hmac.compare_digest(provided.encode("utf-8"), HERMES_TOKEN.encode("utf-8"))
+
+
+def _client_ip(request):
+    if TRUST_PROXY:
+        fwd = request.headers.get("x-forwarded-for")
+        if fwd:
+            # La derniere entree est celle ajoutee par le proxy de confiance :
+            # les valeurs fournies par le client sont a gauche, donc falsifiables.
+            return fwd.split(",")[-1].strip()
+    client = getattr(request, "client", None)
+    return getattr(client, "host", None) or "inconnu"
+
+
+_rate_windows = {}
+
+
+def _rate_ok(key, limit):
+    """Fenetre glissante de 60 s. Ne leve jamais."""
+    if limit <= 0:
+        return True
+    now = time.time()
+    cutoff = now - 60.0
+    window = _rate_windows.get(key)
+    if window is None:
+        window = _rate_windows[key] = []
+    while window and window[0] <= cutoff:
+        window.pop(0)
+    if len(window) >= limit:
+        return False
+    window.append(now)
+    if len(_rate_windows) > 4000:
+        for stale in [k for k, w in _rate_windows.items() if not w or w[-1] <= cutoff]:
+            _rate_windows.pop(stale, None)
+    return True
+
+
+@app.middleware("http")
+async def security_guard(request: Request, call_next):
+    if request.method == "OPTIONS":
+        return await call_next(request)
+
+    path = request.url.path.rstrip("/") or "/"
+    ip = _client_ip(request)
+    is_chat = path.startswith("/chat")
+    limit = RATE_LIMIT_CHAT_PER_MIN if is_chat else RATE_LIMIT_PER_MIN
+    if not _rate_ok(f"{ip}:{'chat' if is_chat else 'api'}", limit):
+        return JSONResponse(
+            {"detail": "Trop de requetes. Reessayez dans une minute."},
+            status_code=429,
+            headers={"Retry-After": "60"},
+        )
+
+    if AUTH_ENABLED and path not in PUBLIC_PATHS and not _token_ok(request):
+        return JSONResponse(
+            {"detail": "Cle d'acces requise ou invalide."},
+            status_code=401,
+            headers={"WWW-Authenticate": 'Bearer realm="hermes"'},
+        )
+
+    return await call_next(request)
+
+
+@app.on_event("startup")
+def _startup_notice():
+    print(
+        f"[hermes] authentification={'ACTIVE' if AUTH_ENABLED else 'DESACTIVEE'}"
+        f" | origines autorisees={ALLOWED_ORIGINS or 'aucune (meme origine seulement)'}"
+        f" | limite chat={RATE_LIMIT_CHAT_PER_MIN}/min, api={RATE_LIMIT_PER_MIN}/min",
+        flush=True,
+    )
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     allow_credentials=False,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "X-Hermes-Key", "Authorization"],
 )
 
 
@@ -236,7 +358,7 @@ def _ok(name):
 
 def _fail(name, exc):
     _state[name].update(
-        cooldown_until=time.time() + COOLDOWN_SECONDS, last_error=str(exc)[:300]
+        cooldown_until=time.time() + COOLDOWN_SECONDS, last_error=_scrub(str(exc))[:300]
     )
 
 
@@ -268,7 +390,7 @@ def call_llm(messages, tools=None):
             _fail(name, exc)
             errors.append(f"{name}: {exc}")
     raise HTTPException(
-        status_code=502, detail="Aucun fournisseur disponible -> " + " | ".join(errors)
+        status_code=502, detail="Aucun fournisseur disponible -> " + " | ".join(_scrub(e) for e in errors)
     )
 
 
@@ -1259,21 +1381,43 @@ def chat_ui():
 
 
 @app.get("/")
-def home():
-    return {
+def home(request: Request):
+    authenticated = _token_ok(request) if AUTH_ENABLED else True
+    public = {
         "status": "live",
         "app": APP_NAME,
         "ui": "/ui",
-        "memory": "ready" if _index_ready else ("configured" if MONGO_URI else "off"),
-        "storage_configured": bool(MONGO_URI),
-        "tools_enabled": TOOLS_ENABLED,
-        "tools": TOOL_NAMES,
-        "search_backend": active_search_backend(),
-        "search_configured": bool(SEARCH_API_KEY or SEARXNG_URL),
-        "search_budget": search_budget(),
-        "provider_order": [p for p in PROVIDER_ORDER if p in PROVIDERS],
-        "models": {n: PROVIDERS[n]["model"] for n in PROVIDER_ORDER if n in PROVIDERS},
+        "auth_required": AUTH_ENABLED,
     }
+    if not authenticated:
+        # Sans cle : aucune information sur la configuration interne.
+        return public
+    public.update(
+        {
+            "memory": "ready" if _index_ready else ("configured" if MONGO_URI else "off"),
+            "storage_configured": bool(MONGO_URI),
+            "tools_enabled": TOOLS_ENABLED,
+            "tools": TOOL_NAMES,
+            "search_backend": active_search_backend(),
+            "search_configured": bool(SEARCH_API_KEY or SEARXNG_URL),
+            "search_budget": search_budget(),
+            "provider_order": [p for p in PROVIDER_ORDER if p in PROVIDERS],
+            "models": {n: PROVIDERS[n]["model"] for n in PROVIDER_ORDER if n in PROVIDERS},
+            "limits": {
+                "documents_max": MAX_DOCS_PER_USER,
+                "stockage_max_mo": round(MAX_DOCS_BYTES_PER_USER / (1024 * 1024), 1),
+                "requetes_par_minute": RATE_LIMIT_PER_MIN,
+                "messages_par_minute": RATE_LIMIT_CHAT_PER_MIN,
+            },
+        }
+    )
+    return public
+
+
+@app.get("/auth/check")
+def auth_check():
+    """Route protegee : sert a l'interface pour valider la cle saisie."""
+    return {"ok": True, "auth_required": AUTH_ENABLED}
 
 
 @app.get("/tools")
@@ -1514,6 +1658,30 @@ async def upload_document(
         raise HTTPException(
             status_code=413,
             detail=f"fichier trop volumineux (max {MAX_UPLOAD_BYTES // (1024 * 1024)} Mo)",
+        )
+
+    # Plafond de stockage : le MongoDB gratuit est limite, on refuse avant
+    # d'ecrire plutot que de saturer la base.
+    stats = list(
+        docs.aggregate(
+            [
+                {"$match": {"user_id": user_id}},
+                {"$group": {"_id": None, "n": {"$sum": 1}, "octets": {"$sum": "$size"}}},
+            ]
+        )
+    )
+    count = int(stats[0]["n"]) if stats else 0
+    used = int(stats[0].get("octets") or 0) if stats else 0
+    if count >= MAX_DOCS_PER_USER:
+        raise HTTPException(
+            status_code=429,
+            detail=f"limite de {MAX_DOCS_PER_USER} documents atteinte : supprimez-en un avant d'en ajouter",
+        )
+    if used + len(raw) > MAX_DOCS_BYTES_PER_USER:
+        raise HTTPException(
+            status_code=429,
+            detail=f"espace de stockage epuise ({used // (1024 * 1024)} Mo utilises sur "
+            f"{MAX_DOCS_BYTES_PER_USER // (1024 * 1024)} Mo) : supprimez des documents",
         )
     try:
         text, kind = extract_document_text(file.filename or "document", raw)

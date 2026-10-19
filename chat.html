@@ -167,6 +167,17 @@
   .dropzone{position:absolute;inset:0;z-index:5;display:none;align-items:center;justify-content:center;background:rgba(10,12,14,.85);border:2px dashed rgba(224,166,60,.5);font-size:14px;color:var(--amber-soft);pointer-events:none}
   body[data-drop="1"] .dropzone{display:flex}
 
+  /* ---------------- verrouillage ---------------- */
+  .lock{position:fixed;inset:0;z-index:90;display:none;align-items:center;justify-content:center;background:rgba(8,10,12,.95);backdrop-filter:blur(7px);padding:calc(var(--step)*3)}
+  body[data-lock="1"] .lock{display:flex}
+  .lock__card{width:min(430px,100%);background:var(--surface);border:1px solid var(--line);border-radius:var(--radius);padding:calc(var(--step)*3);display:flex;flex-direction:column;gap:calc(var(--step)*1.5);box-shadow:var(--shadow)}
+  .lock__card h2{margin:0;font-family:Fraunces,Georgia,serif;font-size:21px;color:var(--text)}
+  .lock__card p{margin:0;font-size:12.5px;color:var(--muted);line-height:1.6}
+  .lock__card input{width:100%}
+  .lock__err{font-size:12px;color:#f0a596;min-height:17px}
+  .lock__card button{width:100%}
+  .lock__mark{width:38px;height:38px;border-radius:11px;display:flex;align-items:center;justify-content:center;background:rgba(224,166,60,.13);border:1px solid rgba(224,166,60,.4);color:var(--amber)}
+
   /* switch */
   .switch{display:flex;align-items:center;justify-content:space-between;gap:var(--step)}
   .switch span{font-size:12.5px;color:var(--muted)}
@@ -372,6 +383,7 @@
       <p class="panel__title">Données</p>
       <div class="quick">
         <button class="danger" id="purgeMemory">Purger ma mémoire</button>
+        <button id="forgetKey" title="Efface la clé d'accès enregistrée dans ce navigateur">Oublier la clé d'accès</button>
       </div>
     </div>
 
@@ -427,6 +439,19 @@
 
 <div class="toast" id="toast" role="status" aria-live="polite"></div>
 
+<div class="lock" id="lock" role="dialog" aria-modal="true" aria-labelledby="lockTitle">
+  <form class="lock__card" id="lockForm" autocomplete="on">
+    <div class="lock__mark" aria-hidden="true">
+      <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="4" y="10.5" width="16" height="10" rx="2"/><path d="M8 10.5V7.5a4 4 0 0 1 8 0v3"/></svg>
+    </div>
+    <h2 id="lockTitle">Clé d'accès</h2>
+    <p>Cet agent est protégé. Saisissez la clé d'accès pour continuer. Elle reste enregistrée dans ce navigateur, vous n'aurez à la saisir qu'une fois.</p>
+    <input id="lockKey" class="mono" type="password" name="hermes-key" placeholder="clé d'accès" autocomplete="current-password" spellcheck="false" aria-label="Clé d'accès">
+    <div class="lock__err" id="lockErr" role="alert" aria-live="assertive"></div>
+    <button class="primary" type="submit">Déverrouiller</button>
+  </form>
+</div>
+
 <script>
 (function () {
   "use strict";
@@ -434,16 +459,21 @@
   /* ------------------------------------------------------------------ *
    * Configuration
    * ------------------------------------------------------------------ */
-  const IS_LOCAL = location.protocol === "file:" || /^(localhost|127\.0\.0\.1|\[::1\])$/.test(location.hostname);
-  const DEFAULT_API = IS_LOCAL ? "https://hermes-agent-gemma.onrender.com" : location.origin;
-  const LS = { api: "hermes.api", user: "hermes.user", session: "hermes.session", tools: "hermes.tools" };
+  // L'interface est servie par l'API elle-meme : on utilise donc la meme
+  // origine. Seul le cas "fichier ouvert directement" vise le service deploye.
+  const IS_FILE = location.protocol === "file:";
+  const DEFAULT_API = IS_FILE ? "https://hermes-agent-gemma.onrender.com" : location.origin;
+  const LS = { api: "hermes.api", user: "hermes.user", session: "hermes.session", tools: "hermes.tools", key: "hermes.key" };
   const REMINDER_POLL_MS = 45000;
 
   const state = {
-    api: localStorage.getItem(LS.api) || DEFAULT_API,
+    // Toujours l'origine courante : evite qu'une ancienne URL reste figee
+    // dans le navigateur et pointe vers un service obsolete.
+    api: DEFAULT_API,
     user: localStorage.getItem(LS.user) || "fares",
     session: localStorage.getItem(LS.session) || "default",
     useTools: localStorage.getItem(LS.tools) !== "0",
+    key: localStorage.getItem(LS.key) || "",
     busy: false,
     timer: null
   };
@@ -501,13 +531,49 @@
   }
 
   function persist() {
-    localStorage.setItem(LS.api, state.api);
     localStorage.setItem(LS.user, state.user);
     localStorage.setItem(LS.session, state.session);
     localStorage.setItem(LS.tools, state.useTools ? "1" : "0");
+    if (state.key) localStorage.setItem(LS.key, state.key);
+    else localStorage.removeItem(LS.key);
     $("apiLabel").textContent = state.api.replace(/^https?:\/\//, "");
     $("whoPill").textContent = state.user + " / " + state.session;
     $("filLabel").textContent = state.session;
+  }
+
+  /* ---- cle d'acces ---- */
+  function authHeaders(extra) {
+    const h = Object.assign({}, extra || {});
+    if (state.key) h["X-Hermes-Key"] = state.key;
+    return h;
+  }
+
+  function showLock(message) {
+    $("lockErr").textContent = message || "";
+    document.body.dataset.lock = "1";
+    const input = $("lockKey");
+    if (input && !input.value) input.focus();
+  }
+
+  function hideLock() {
+    document.body.dataset.lock = "0";
+    $("lockErr").textContent = "";
+  }
+
+  async function submitKey(key) {
+    state.key = key;
+    persist();
+    try {
+      await api("/auth/check");
+      hideLock();
+      $("lockKey").value = "";
+      toast("Accès autorisé", "info");
+      boot();
+    } catch (err) {
+      state.key = "";
+      persist();
+      showLock(/401|requise/i.test(err.message) ? "Clé refusée." : err.message);
+    }
   }
 
   /* ------------------------------------------------------------------ *
@@ -593,11 +659,15 @@
   const base = () => state.api.replace(/\/+$/, "");
 
   async function api(path, options) {
-    const res = await fetch(base() + path, options);
+    const opts = Object.assign({}, options || {});
+    opts.headers = authHeaders(opts.headers);
+    const res = await fetch(base() + path, opts);
     const text = await res.text();
     let data = null;
     try { data = JSON.parse(text); } catch (e) { /* non JSON */ }
     if (!res.ok) {
+      if (res.status === 401 && path !== "/") showLock("Clé d'accès requise.");
+      if (res.status === 429) toast("Trop de requêtes : patientez une minute.", "error");
       const detail = data && data.detail ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail)) : text;
       throw new Error("HTTP " + res.status + " — " + String(detail).slice(0, 300));
     }
@@ -612,10 +682,11 @@
   async function streamChat(payload, on) {
     const res = await fetch(base() + "/chat/stream", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: authHeaders({ "Content-Type": "application/json" }),
       body: JSON.stringify(payload)
     });
     if (!res.ok || !res.body) {
+      if (res.status === 401) showLock("Clé d'accès requise.");
       const text = await res.text().catch(() => "");
       throw new Error("HTTP " + res.status + " " + text.slice(0, 200));
     }
@@ -900,11 +971,16 @@
     fd.append("file", file, file.name);
     fd.append("session_id", state.session);
     try {
-      const res = await fetch(base() + "/upload/" + encodeURIComponent(state.user), { method: "POST", body: fd });
+      const res = await fetch(base() + "/upload/" + encodeURIComponent(state.user), {
+        method: "POST",
+        headers: authHeaders(),
+        body: fd
+      });
       const text = await res.text();
       let data = null;
       try { data = JSON.parse(text); } catch (e) { /* ignore */ }
       if (!res.ok) {
+        if (res.status === 401) showLock("Clé d'accès requise.");
         const detail = data && data.detail
           ? (typeof data.detail === "string" ? data.detail : JSON.stringify(data.detail))
           : text;
@@ -1169,6 +1245,21 @@
     } catch (err) { toast(err.message); }
   });
 
+  $("forgetKey").addEventListener("click", () => {
+    state.key = "";
+    persist();
+    $("lockKey").value = "";
+    showLock("Clé oubliée. Saisissez-la à nouveau.");
+  });
+
+  $("lockForm").addEventListener("submit", (e) => {
+    e.preventDefault();
+    const key = $("lockKey").value.trim();
+    if (!key) { $("lockErr").textContent = "Saisissez la clé."; return; }
+    $("lockErr").textContent = "Vérification…";
+    submitKey(key);
+  });
+
   function startPolling() {
     if (state.timer) clearInterval(state.timer);
     state.timer = setInterval(() => refreshReminders(), REMINDER_POLL_MS);
@@ -1180,20 +1271,50 @@
   /* ------------------------------------------------------------------ *
    * Démarrage
    * ------------------------------------------------------------------ */
-  $("userId").value = state.user;
-  $("useTools").checked = state.useTools;
-  persist();
-  buildQuick();
-  autosize();
-  wireDrop();
-  loadTools();
-  refreshProviders();
-  refreshSessions();
-  refreshReminders();
-  refreshDocs();
-  startPolling();
-  switchSession(state.session);
-  promptEl.focus();
+  let booted = false;
+
+  function boot() {
+    $("userId").value = state.user;
+    $("useTools").checked = state.useTools;
+    persist();
+    if (!booted) {
+      buildQuick();
+      autosize();
+      wireDrop();
+      booted = true;
+    }
+    loadTools();
+    refreshProviders();
+    refreshSessions();
+    refreshReminders();
+    refreshDocs();
+    startPolling();
+    switchSession(state.session);
+    promptEl.focus();
+  }
+
+  /* L'acces est verifie avant tout chargement : pas de requete inutile
+     ni de message d'erreur si la cle manque. */
+  (async function start() {
+    let info = null;
+    try {
+      info = await api("/");
+    } catch (err) {
+      toast(err.message);
+      return;
+    }
+    if (!info.auth_required) { boot(); return; }
+    if (!state.key) {
+      showLock("Saisissez votre clé d'accès pour continuer.");
+      return;
+    }
+    try {
+      await api("/auth/check");
+      boot();
+    } catch (err) {
+      showLock(/401|requise/i.test(err.message) ? "Clé refusée ou expirée." : err.message);
+    }
+  })();
 })();
 </script>
 </body>
