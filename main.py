@@ -242,9 +242,13 @@ app.add_middleware(
 
 
 def _mask(secret):
+    """N'affiche que les 4 derniers caracteres : suffisant pour identifier
+    une cle, insuffisant pour la reconstituer."""
     if not secret:
         return None
-    return secret[:6] + "****" + secret[-4:] if len(secret) > 12 else "****"
+    if len(secret) <= 4:
+        return "****"
+    return "****" + secret[-4:]
 
 
 def _iso(value):
