@@ -1,4 +1,5 @@
 import ast
+import gzip
 import hmac
 import html as htmlmod
 import io
@@ -13,6 +14,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+import zlib
 from datetime import datetime, timedelta, timezone
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -504,6 +506,26 @@ def _strip_html(text):
     return re.sub(r"\s+", " ", htmlmod.unescape(text)).strip()
 
 
+def _decompress_body(raw, content_encoding):
+    """Decompresse une reponse HTTP compressee. Retourne (octets, erreur)."""
+    enc = (content_encoding or "").lower().strip()
+    if not enc or enc == "identity":
+        return raw, None
+    try:
+        if "gzip" in enc or "x-gzip" in enc:
+            return gzip.decompress(raw), None
+        if "deflate" in enc:
+            try:
+                return zlib.decompress(raw), None
+            except zlib.error:
+                return zlib.decompress(raw, -zlib.MAX_WBITS), None
+        if "br" in enc:
+            return raw, "compression Brotli non geree (contenu illisible)"
+    except Exception as exc:  # noqa: BLE001
+        return raw, f"decompression impossible ({exc})"
+    return raw, None
+
+
 def tool_get_datetime(args):
     offset = float(args.get("timezone_offset_hours", 0) or 0)
     now = datetime.now(timezone.utc).astimezone(timezone(timedelta(hours=offset)))
@@ -567,12 +589,25 @@ def tool_web_fetch(args):
     if not parsed.hostname or not _is_public_host(parsed.hostname):
         return "erreur: hote non autorise"
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": USER_AGENT,
+                # On annonce qu'on sait decompresser : sinon certains sites
+                # (python.org par exemple) repondent en gzip et on recevrait
+                # du binaire illisible.
+                "Accept-Encoding": "gzip, deflate",
+            },
+        )
         with urllib.request.urlopen(req, timeout=20) as resp:  # noqa: S310
             raw = resp.read(400000)
             charset = resp.headers.get_content_charset() or "utf-8"
+            content_encoding = resp.headers.get("Content-Encoding")
     except Exception as exc:  # noqa: BLE001
         return f"erreur: {exc}"
+    raw, err = _decompress_body(raw, content_encoding)
+    if err:
+        return f"erreur: {err}"
     try:
         text = raw.decode(charset, "replace")
     except LookupError:
@@ -594,12 +629,17 @@ def _http_get(url, headers=None, timeout=None):
         headers={
             "User-Agent": USER_AGENT,
             "Accept-Language": "fr-FR,fr;q=0.9,en;q=0.8",
+            "Accept-Encoding": "gzip, deflate",
             **(headers or {}),
         },
     )
     with urllib.request.urlopen(req, timeout=timeout or SEARCH_TIMEOUT) as resp:  # noqa: S310
         raw = resp.read(600000)
         charset = resp.headers.get_content_charset() or "utf-8"
+        content_encoding = resp.headers.get("Content-Encoding")
+    raw, err = _decompress_body(raw, content_encoding)
+    if err:
+        raise ValueError(err)
     try:
         return raw.decode(charset)
     except (UnicodeDecodeError, LookupError):
